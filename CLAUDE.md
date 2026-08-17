@@ -32,7 +32,7 @@ RTMPose 人体姿态 demo：检测关键点 → 判断「静止 / 在动 / 无�
 ```bash
 python main_demo.py --camera 0                        # 桌面版
 python main_demo.py --selftest                        # 合成数据自测各层（不碰摄像头）
-python web_demo.py --port 8080                        # Web：浏览器打开 http://127.0.0.1:8080
+python web_demo.py --port 8080                        # Web 版（浏览器摄像头，用法见 README）
 ```
 
 （在 `rtm_demo/` 目录下运行。）
