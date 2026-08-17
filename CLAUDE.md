@@ -27,7 +27,7 @@ RTMPose 人体姿态 demo：检测关键点 → 判断「静止 / 在动 / 无�
 
 ## 运行
 
-本机用 `D:\python3.14.2\python.exe` 或 `rtm_demo\..\venv\Scripts\python.exe`（都装了 cv2/onnxruntime）；默认 `python` 缺依赖。
+命令里的 `python` 指装了 cv2/numpy/onnxruntime 的解释器（安装方法见 README「环境要求」）。
 
 ```bash
 python main_demo.py --camera 0                        # 桌面版
