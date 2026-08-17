@@ -18,9 +18,11 @@ debug 模式：
 坐姿角度 + 坐姿状态 + 提醒横幅 + 骨架（新增）：
     draw(..., posture, reminder, pose, posture_state, posture_reminder) 可选参数。
     posture: PostureFeatures.update() 的返回值，至少含 'head_neck_angle'，
-            髋可见时另含 'torso_angle'/'back_curvature'。在状态标签下追加一行
-            `Torso 8.2°  Neck 5.1°  Back 6.0°`；**key 缺失（该角度算不出，
-            如髋不可见）时显示 `N/A`，保证这一行始终出现**，而不是整行消失。
+            髋可见时另含 'torso_angle'/'back_curvature'，双侧肩在时含
+            'neck_compression'（比值，无单位）。在状态标签下追加一行
+            `Torso 8.2°  Neck 5.1°  Back 6.0°  Head 0.75`；**key 缺失（该
+            角度算不出，如髋不可见/单侧链路无肩宽）时显示 `N/A`，保证这一
+            行始终出现**，而不是整行消失。
     reminder: SedentaryAlert 触发的久坐提醒文案（英文）。画成顶部横幅
             （cv2 绘制），停留 reminder_hold_sec 秒。
     posture_state: PostureDecision.posture（PostureState 枚举）。在角度行下方
@@ -160,8 +162,10 @@ class FrameRenderer:
         参数:
             state / movement: 同原有签名。
             posture: PostureFeatures.update() 的返回值（至少含 head_neck_angle；
-                     torso/back 在髋不可见时缺失）。非 None 时在状态标签下追加
-                     一行 `Torso x.x°  Neck x.x°  Back x.x°`，缺失的角度显示 N/A。
+                     torso/back 在髋不可见时缺失；neck_compression 在单侧链路
+                     无肩宽时缺失）。非 None 时在状态标签下追加一行
+                     `Torso x.x°  Neck x.x°  Back x.x°  Head x.xx`，缺失的
+                     项显示 N/A（颈压缩为比值，显示两位小数，无 °）。
             reminder: SedentaryAlert 触发的久坐提醒文案（英文）。非 None 时记录
                      横幅并停留 reminder_hold_sec 秒。
             pose:    pose_estimation.detect_pose() 的返回值（landmarks + image_size）。
@@ -197,16 +201,22 @@ class FrameRenderer:
         cv2.putText(frame, label, (12, 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
 
-        # 坐姿角度（英文，紧跟状态标签下方）。
-        # posture 至少含 head_neck_angle；torso/back 在髋不可见时缺失 → 显示 N/A
+        # 坐姿特征（英文，紧跟状态标签下方）。
+        # posture 至少含 head_neck_angle；torso/back 在髋不可见时缺失、
+        # neck_compression 在单侧链路（无肩宽）时缺失 → 都显示 N/A。
+        # 颈压缩是比值（耳-肩竖直间距/肩宽），两位小数、无 °，见左下角图例。
         if posture is not None:
             def _fmt(key: str) -> str:
                 v = posture.get(key)
                 return f"{v:.1f}°" if v is not None else "N/A"
+            def _fmt_ratio(key: str) -> str:
+                v = posture.get(key)
+                return f"{v:.2f}" if v is not None else "N/A"
             posture_line = (
                 f"Torso {_fmt('torso_angle')}  "
                 f"Neck {_fmt('head_neck_angle')}  "
-                f"Back {_fmt('back_curvature')}"
+                f"Back {_fmt('back_curvature')}  "
+                f"Head {_fmt_ratio('neck_compression')}"
             )
             cv2.putText(frame, posture_line, (12, 56),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1,

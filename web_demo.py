@@ -29,7 +29,7 @@ pose_estimation / features / decision 整条判定链完全复用，核心算法
     已改为后端只回关键点 JSON、浏览器本地画骨架，尽量缓解。
 
 范围说明（沿用现有实现，不做新决定）：
-    - 风险判定 = 当前现有规则（静止/在动、坐姿/弓背、计时提醒）
+    - 风险判定 = 当前现有规则（静止/在动、坐姿/弓背[头颈角/躯干角/背曲角/颈压缩任一超限]、计时提醒）
     - RULA / REBA：未接入（开放问题，未定）
     - 单 / 多人：沿用"整帧单一人"实现（开放问题，未定，临时沿用）
     - keypoint schema：COCO 17（代码已固定）
@@ -59,7 +59,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import cv2                                      # noqa: E402
 import numpy as np                              # noqa: E402
-from pose_estimation import detect_pose         # noqa: E402
+from pose_estimation import detect_pose_with_score   # noqa: E402
 from features import (FeatureExtractor,         # noqa: E402
                       PostureFeatures)
 from decision import (StillnessDecision,        # noqa: E402
@@ -68,6 +68,10 @@ from decision import (StillnessDecision,        # noqa: E402
 
 # /analyze 单帧最大体积（约几 MB 足够），防止异常大请求拖垮服务
 MAX_ANALYZE_BYTES = 4_000_000
+
+# 临时标定：/analyze 帧计数器 + 上次打印时间（每约 8 帧打一行日志，标定完删除）
+_dbg_frames = [0]
+_dbg_last_ts = [time.monotonic()]
 
 
 # ---------- 页面 HTML（模块级常量；浏览器端中文 OK，与 cv2 的 Hershey 字体无关） ----------
@@ -126,10 +130,13 @@ PAGE_HTML = """<!DOCTYPE html>
     <h3>实时判定</h3>
     <div class="row"><span class="k">人员状态</span><span class="v" id="state">--</span></div>
     <div class="row"><span class="k">移动量</span><span class="v" id="movement">--</span></div>
+    <div class="row"><span class="k">检测分</span><span class="v" id="score">--</span></div>
+    <div class="row"><span class="k">躯干点</span><span class="v" id="tvalid">--</span></div>
     <div class="row"><span class="k">坐姿状态</span><span class="v" id="posture">--</span></div>
     <div class="row"><span class="k">头颈角</span><span class="v" id="neck">--</span></div>
     <div class="row"><span class="k">躯干角</span><span class="v" id="torso">--</span></div>
     <div class="row"><span class="k">背曲角</span><span class="v" id="back">--</span></div>
+    <div class="row"><span class="k">颈压缩</span><span class="v" id="neckgap">--</span></div>
     <div class="row"><span class="k">连续静坐</span><span class="v" id="still">--</span></div>
     <div class="row"><span class="k">连续弓背</span><span class="v" id="slump">--</span></div>
     <div class="row"><span class="k">久坐提醒</span><span class="v reminder" id="reminder"></span></div>
@@ -140,7 +147,7 @@ PAGE_HTML = """<!DOCTYPE html>
 <div class="note">
   <h3>当前规则与范围说明</h3>
   <ul>
-    <li><b>风险判定 = 当前现有规则</b>：静止 / 在动（移动量双阈值）、坐姿 / 弓背（GOOD / SLUMPED）、久坐 / 弓背计时提醒。</li>
+    <li><b>风险判定 = 当前现有规则</b>：静止 / 在动（移动量双阈值）、坐姿 / 弓背（GOOD / SLUMPED：头颈角 / 躯干角 / 背曲角 / 颈压缩任一超限即弓背）、久坐 / 弓背计时提醒。</li>
     <li><b>摄像头来源</b>：始终取"打开这个网页的人"自己的摄像头（浏览器采集，帧发后端识别，骨架在浏览器本地绘制）。</li>
     <li><b>RULA / REBA</b>：未接入（开放问题，未定）。</li>
     <li><b>单 / 多人</b>：沿用现有"整帧单一人"实现（开放问题，未定，临时沿用）。</li>
@@ -170,12 +177,17 @@ PAGE_HTML = """<!DOCTYPE html>
     st.textContent = s.state || '--';
     st.className = 'v ' + String(s.state || '').toLowerCase();
     document.getElementById('movement').textContent = fmt(s.movement, '');
+    document.getElementById('score').textContent = fmt(s.score, '');
+    var tv = document.getElementById('tvalid');
+    tv.textContent = (s.torso_avg === null || s.torso_avg === undefined)
+      ? '--' : (s.torso_valid + '/4 均' + s.torso_avg);
     var pst = document.getElementById('posture');
     pst.textContent = s.posture_state || '--';
     pst.className = 'v ' + String(s.posture_state || '').toLowerCase();
     document.getElementById('neck').textContent = fmt(s.head_neck_angle, '°');
     document.getElementById('torso').textContent = fmt(s.torso_angle, '°');
     document.getElementById('back').textContent = fmt(s.back_curvature, '°');
+    document.getElementById('neckgap').textContent = fmt(s.neck_compression, '');
     document.getElementById('still').textContent = fmt(s.still_elapsed_sec, ' s');
     document.getElementById('slump').textContent = fmt(s.slump_elapsed_sec, ' s');
     document.getElementById('reminder').textContent = s.reminder || '';
@@ -303,16 +315,40 @@ def build_chain(args: argparse.Namespace):
     返回 (feats, post, dec, alert, pdec, palert)。跨帧状态判定
     （移动量窗口、静坐/弓背计时）依赖链实例常驻，因此只建一条全局共用。
     """
-    feats = FeatureExtractor(window_seconds=args.window_seconds)
-    post = PostureFeatures()
+    # 低帧率适配：手机经隧道画面实际约 0.5~1fps，桌面版的 3s/5 帧窗口永远
+    # 攒不满 → 移动量恒空。web 入口放宽窗口参数 + 降低可见性门限（0.15，
+    # 与 DETECT_SCORE_THRESHOLD 一致；手机画面分数低于桌面 0.3）。
+    feats = FeatureExtractor(window_seconds=args.window_seconds,
+                             min_frames=args.min_frames,
+                             min_window_seconds=args.min_window_seconds,
+                             visibility_min=args.visibility_min)
+    post = PostureFeatures(visibility_min=args.visibility_min)
     dec = StillnessDecision(still_threshold=args.still_threshold,
                             moving_threshold=args.moving_threshold)
     alert = SedentaryAlert(duration_limit_sec=args.duration_limit)
     pdec = PostureDecision(head_neck_threshold=args.head_neck_threshold,
                            torso_threshold=args.torso_threshold,
-                           back_threshold=args.back_threshold)
+                           back_threshold=args.back_threshold,
+                           neck_threshold=args.neck_threshold)
     palert = PostureAlert(duration_limit_sec=args.posture_duration_limit)
     return feats, post, dec, alert, pdec, palert
+
+
+def _torso_stats(pose):
+    """躯干 4 点（肩 5/6、髋 11/12）的可见性统计，用于标定。
+
+    移动量（FeatureExtractor）和坐姿角度（PostureFeatures）都要求关键点
+    visibility >= 0.3 才计入；电话端整体分数偏低时，躯干点容易被这条门限
+    整帧丢掉 → 移动量恒空。返回 (过 0.3 门限的点数 0~4, 4 点平均置信度)，
+    pose 为 None 时返回 (0, None)。
+    """
+    if pose is None:
+        return 0, None
+    lm = pose.get('landmarks') or []
+    vis = [lm[i][3] for i in (5, 6, 11, 12) if i < len(lm)]
+    if not vis:
+        return 0, None
+    return sum(1 for v in vis if v >= 0.3), round(sum(vis) / len(vis), 3)
 
 
 def analyze_frame(jpeg_bytes: bytes, args: argparse.Namespace) -> dict:
@@ -336,7 +372,7 @@ def analyze_frame(jpeg_bytes: bytes, args: argparse.Namespace) -> dict:
 
         ts = time.monotonic()
         try:
-            pose = detect_pose(frame)
+            pose, score = detect_pose_with_score(frame)
             movement = feats.update(pose, ts)
             state_ = dec.update(movement)
             posture = post.update(pose)
@@ -346,14 +382,41 @@ def analyze_frame(jpeg_bytes: bytes, args: argparse.Namespace) -> dict:
         except Exception as e:
             return {"error": f"pipeline 异常: {type(e).__name__}: {e}"}
 
+        torso_valid, torso_avg = _torso_stats(pose)
+
+        # 临时标定日志：每 8 帧打一行，含实际 fps + 坐姿特征（标定完删除）
+        _dbg_frames[0] += 1
+        if _dbg_frames[0] % 8 == 0:
+            _now = time.monotonic()
+            span = _now - _dbg_last_ts[0]
+            _dbg_last_ts[0] = _now
+            fps = 8 / span if span > 0 else 0.0
+            hn = posture.get('head_neck_angle') if posture else None
+            to = posture.get('torso_angle') if posture else None
+            bc = posture.get('back_curvature') if posture else None
+            nc = posture.get('neck_compression') if posture else None
+            a = lambda v: '--' if v is None else f"{v:.0f}"
+            b = lambda v: '--' if v is None else f"{v:.2f}"
+            print(f"[dbg] #{_dbg_frames[0]} fps={fps:.1f} "
+                  f"score={score:.3f} detected={pose is not None} "
+                  f"torso={torso_valid}/4 avg={torso_avg} "
+                  f"mov={movement if movement is None else round(movement, 4)} "
+                  f"state={state_.value} post={posture_state.value} "
+                  f"ang=(hn:{a(hn)} to:{a(to)} bc:{a(bc)} nc:{b(nc)})",
+                  flush=True)
+
         return {
             "detected": pose is not None,
+            "score": round(score, 3),  # 本帧整体置信度（标定 DETECT_SCORE_THRESHOLD 用）
+            "torso_valid": torso_valid,   # 躯干点过 0.3 门限的个数（0~4）
+            "torso_avg": torso_avg,       # 躯干 4 点平均置信度（判断门限卡没卡）
             "state": state_.value,
             "movement": round(movement, 4) if movement is not None else None,
             "posture_state": posture_state.value,
             "head_neck_angle": _round_angle(posture, "head_neck_angle"),
             "torso_angle": _round_angle(posture, "torso_angle"),
             "back_curvature": _round_angle(posture, "back_curvature"),
+            "neck_compression": _round_value(posture, "neck_compression", 2),
             "still_elapsed_sec": round(alert.elapsed_sec, 1),
             "slump_elapsed_sec": round(palert.elapsed_sec, 1),
             "reminder": reminder,
@@ -370,6 +433,18 @@ def _round_angle(posture, key):
         return None
     val = posture.get(key)
     return round(val, 1) if val is not None else None
+
+
+def _round_value(posture, key, digits):
+    """posture dict 里取值并 round 到 digits 位小数；缺 key / 值为 None → None。
+
+    颈压缩是比值（0~1 量级），标定需要两位小数，单独一个 helper（角度仍用
+    _round_angle 一位小数 + °）。
+    """
+    if posture is None:
+        return None
+    val = posture.get(key)
+    return round(val, digits) if val is not None else None
 
 
 # ---------- HTTP 处理 ----------
@@ -438,10 +513,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="debug：画面上画移动量走势图")
     p.add_argument("--still-threshold", type=float, default=0.05,
                    help="静止阈值（移动量 <= 此值判静止），默认 0.05")
-    p.add_argument("--moving-threshold", type=float, default=0.10,
-                   help="在动阈值（移动量 >= 此值判在动），默认 0.10")
-    p.add_argument("--window-seconds", type=float, default=3.0,
-                   help="滑动窗口时长（秒），默认 3.0")
+    p.add_argument("--moving-threshold", type=float, default=0.07,
+                   help="在动阈值（移动量 >= 此值判在动），web 默认 0.07（低帧率下让中等移动也能触发；桌面 main_demo 仍 0.10）")
+    p.add_argument("--window-seconds", type=float, default=5.0,
+                   help="移动量滑动窗口时长（秒），web 默认 5（手机经隧道帧率 ~0.6fps，窗口需 ≥3 帧间隔≈4.8s 才能算；5 是响应与抗噪的折中；桌面版 main_demo 仍是 3）")
+    p.add_argument("--min-frames", type=int, default=2,
+                   help="移动量窗口最少帧数，默认 2（低帧率 ~0.6fps 下最快响应；静止实测 mov≈0.02，2 帧中位仍抗噪）")
+    p.add_argument("--min-window-seconds", type=float, default=1.0,
+                   help="移动量窗口首尾帧最小跨度（秒），默认 1.0（2 帧跨度 ≈1.6s 已满足）")
+    p.add_argument("--visibility-min", type=float, default=0.15,
+                   help="关键点可见性门限（移动量/坐姿角度要求点分数>=此值），web 默认 0.15（手机画面分数低于桌面 0.3）")
     p.add_argument("--duration-limit", type=float, default=20.0,
                    help="连续久坐多少秒触发提醒，默认 20（测试用短阈值；生产建议 1200）")
     p.add_argument("--head-neck-threshold", type=float, default=30.0,
@@ -450,6 +531,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="躯干前倾角阈值（度），默认 30")
     p.add_argument("--back-threshold", type=float, default=25.0,
                    help="背部弯曲角阈值（度），默认 25")
+    p.add_argument("--neck-threshold", type=float, default=0.45,
+                   help="颈压缩阈值（耳-肩竖直间距/肩宽，无单位比值；"
+                        "小于此值判弓背，正面摄像头对前弓背敏感），"
+                        "默认 0.45（起始猜测，看页面 Head/颈压缩读数标定）")
     p.add_argument("--posture-duration-limit", type=float, default=10.0,
                    help="连续不良坐姿多少秒触发提醒，默认 10（测试用短阈值；生产建议 300）")
     p.add_argument("--reminder-hold", type=float, default=8.0,

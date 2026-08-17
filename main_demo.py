@@ -55,6 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="躯干前倾角阈值（度），超过判不良坐姿，默认 30")
     p.add_argument("--back-threshold", type=float, default=25.0,
                    help="背部弯曲角阈值（度），超过判弓背，默认 25")
+    p.add_argument("--neck-threshold", type=float, default=0.45,
+                   help="颈压缩阈值（耳-肩竖直间距/肩宽，无单位比值；"
+                        "小于此值判弓背，正面摄像头对前弓背敏感），"
+                        "默认 0.45（起始猜测，--debug 看 Head 读数标定）")
     p.add_argument("--posture-duration-limit", type=float, default=10.0,
                    help="连续不良坐姿多少秒触发提醒，默认 10（测试用短阈值；生产建议 300）")
     p.add_argument("--reminder-hold", type=float, default=8.0,
@@ -82,7 +86,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
     alert = SedentaryAlert(duration_limit_sec=args.duration_limit)
     pdec = PostureDecision(head_neck_threshold=args.head_neck_threshold,
                            torso_threshold=args.torso_threshold,
-                           back_threshold=args.back_threshold)
+                           back_threshold=args.back_threshold,
+                           neck_threshold=args.neck_threshold)
     palert = PostureAlert(duration_limit_sec=args.posture_duration_limit)
     ren = FrameRenderer(still_threshold=args.still_threshold,
                         moving_threshold=args.moving_threshold,
@@ -93,6 +98,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
                         posture_duration_limit_sec=args.posture_duration_limit)
 
     print("正在初始化 pose 检测器")
+    dbg_cnt = 0  # 临时标定用计数器（标定完删除）
     with src:
         while True:
             frame = src.read()
@@ -106,6 +112,17 @@ def run_pipeline(args: argparse.Namespace) -> None:
             state = dec.update(movement)
             posture = post.update(pose)
             posture_state = pdec.update(posture)
+            # 临时标定：--debug 下每 30 帧（约 1s）打印一次坐姿特征（标定完删除）
+            dbg_cnt += 1
+            if args.debug and dbg_cnt % 30 == 0:
+                hn = posture.get('head_neck_angle') if posture else None
+                to = posture.get('torso_angle') if posture else None
+                bc = posture.get('back_curvature') if posture else None
+                nc = posture.get('neck_compression') if posture else None
+                a = lambda v: '--' if v is None else f"{v:.0f}"
+                b = lambda v: '--' if v is None else f"{v:.2f}"
+                print(f"[dbg] ang=(hn:{a(hn)} to:{a(to)} bc:{a(bc)} nc:{b(nc)}) "
+                      f"post={posture_state.value}", flush=True)
             reminder = alert.update(state, ts)
             posture_reminder = palert.update(posture_state, ts)
             if reminder is not None:

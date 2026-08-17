@@ -51,6 +51,7 @@ python web_demo.py --port 8080                        # Web 版（浏览器摄�
 - 检测人：`pose_estimation.py` 的 `DETECT_SCORE_THRESHOLD=0.15`（17 点平均置信度，实测真人 ~0.88 / 空场景 ~0.10）。常检不出人可降到 ~0.12；太低会对空场景误检。
 - 静止：`--still-threshold` 默认 0.05，静坐时移动量 ≈ 0；偶发跳 MOVING 提到 0.06~0.07（`--debug` 看移动量曲线再定）。`--moving-threshold` 默认 0.10 一般不动。
 - 坐姿角度阈值（`--head-neck-threshold` 30 / `--torso-threshold` 30 / `--back-threshold` 25）是起始猜测：看画面实时 `Torso/Neck/Back` 读数标定，迟滞固定阈值的 80%（`hysteresis_ratio=0.8`）。
+- 颈压缩 `--neck-threshold`（默认 0.45，无单位比值 = 耳-肩竖直间距/肩宽）：**越小越弓背**（耸肩+低头会压扁耳肩间距）。正面摄像头下前弓背主要靠它抓——torso/back/neck 三个角在正面投影里几乎不变，且坐着髋常被桌子挡掉只剩 head_neck/颈压缩可判。坐直 ~0.5~0.8、弓背 ~0.3 上下，但随取景和身体比例变化很大，用 `--debug` 看 `Head` 读数标定。
 - 提醒时长：decision.py 类默认 1200s / 300s（生产值），main/web 的 CLI 默认 20 / 10（测试短阈值）。
 
 ## 开放问题（不要替用户决定）

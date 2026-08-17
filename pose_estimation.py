@@ -21,6 +21,9 @@ RTMPose 是 top-down 模型，本来需要先框出人的包围盒再推理。�
             9 左腕, 10 右腕, 11 左髋, 12 右髋,
             13 左膝, 14 右膝, 15 左踝, 16 右踝
         坐姿相关躯干点是 5/6/11/12，耳朵是 3/4。
+    detect_pose_with_score(frame_bgr) -> (dict | None, float)
+        新加的调试/标定接口：结果与 detect_pose 一致，额外返回本帧整体
+        置信度分数（未检测到也返回），供 web 端显示来标定 DETECT_SCORE_THRESHOLD。
     landmarks_to_pixels(landmarks, image_size) -> [(x, y) x17]
 """
 
@@ -124,6 +127,22 @@ def detect_pose(frame_bgr):
             9 左腕, 10 右腕, 11 左髋, 12 右髋,
             13 左膝, 14 右膝, 15 左踝, 16 右踝
     """
+    result, _score = detect_pose_with_score(frame_bgr)
+    return result
+
+
+def detect_pose_with_score(frame_bgr):
+    """同 detect_pose，额外返回本帧"整体置信度分数"（17 点平均，未检测到也返回）。
+
+    这是新加的调试/标定接口（加能力走"加新方法"，detect_pose 签名保持不变）：
+    web 端把分数显示到页面，看它贴着 DETECT_SCORE_THRESHOLD 有多近，据此判断
+    阈值该往上还是往下调。
+
+    返回:
+        (result, overall_score)：result 与 detect_pose 的返回完全一致（dict | None）；
+        overall_score 恒为 float（0~1，越小越像空场景）。未检测到时 result 为 None，
+        但分数照样返回，方便看"差多少才够到阈值"。
+    """
     sess = get_detector()
 
     input_img = _preprocess(frame_bgr)
@@ -136,7 +155,7 @@ def detect_pose(frame_bgr):
     # 整体置信度 = 各点置信度均值。低于阈值视为"未检测到人"。
     overall_score = float(np.mean(scores))
     if overall_score < DETECT_SCORE_THRESHOLD:
-        return None
+        return None, overall_score
 
     # 归一化到原图坐标：先还原到输入图，再按缩放比映射回原图
     in_w, in_h = INPUT_SIZE
@@ -152,7 +171,7 @@ def detect_pose(frame_bgr):
     return {
         'landmarks': landmarks,
         'image_size': (w, h),
-    }
+    }, overall_score
 
 
 def landmarks_to_pixels(landmarks, image_size):

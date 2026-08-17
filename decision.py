@@ -12,7 +12,11 @@ decision 层：把 features 层给出的特征映射成状态，再决定"要不
     对每个可见角度算 ratio = 角度 / 阈值，取最大者 worst：
     worst >= 1.0            -> SLUMPED（弓背/头前伸/前倾，至少一个超限）
     worst <= hysteresis_ratio -> GOOD（都明显低于阈值）
-    中间 -> 迟滞带，保持当前状态。髋不可见时只按 head_neck_angle 判。
+    中间 -> 迟滞带，保持当前状态。髋不可见时只按 head_neck_angle /
+    neck_compression 判。
+    特殊项 neck_compression（颈压缩，见 features.py）是"越小越弓背"：
+    耸肩+低头会压扁耳-肩竖直间距，正面摄像头也看得到。它和其它角度方向
+    相反，ratio 取倒数（阈值/值），其余迟滞语义完全一致。
 
 "持续满多久才算数"这类时间规则，由 _DurationAlert 基类的两个子类实现：
     SedentaryAlert 累计"连续静止"时长（消费 StillnessDecision.State）；
@@ -27,7 +31,8 @@ decision 层：把 features 层给出的特征映射成状态，再决定"要不
 
     PostureState 枚举：GOOD / SLUMPED / UNKNOWN
     PostureDecision(head_neck_threshold=30.0, torso_threshold=30.0,
-                    back_threshold=25.0, hysteresis_ratio=0.8)
+                    back_threshold=25.0, neck_threshold=0.45,
+                    hysteresis_ratio=0.8)
     update(posture: Optional[dict]) -> PostureState
     posture（只读属性）
 
@@ -230,53 +235,71 @@ class PostureState(enum.Enum):
 
 
 class PostureDecision:
-    """基于三个坐姿角度判断坐姿好坏（迟滞，消费 PostureFeatures 的角度 dict）。
+    """基于坐姿角度/比值判断坐姿好坏（迟滞，消费 PostureFeatures 的 dict）。
 
-    对当前可见的每个角度算 ratio = 角度 / 阈值，取最大者 worst：
+    对当前可见的每个特征算 ratio，取最大者 worst：
         worst >= 1.0              -> SLUMPED（弓背/头前伸/前倾，至少一个超限）
-        worst <= hysteresis_ratio -> GOOD（所有角度都明显低于阈值）
+        worst <= hysteresis_ratio -> GOOD（所有特征都明显优于阈值）
         两者之间                    -> 迟滞带，保持当前状态（防边界抖动）
 
-    只对当前可见的角度判断：髋不可见（人只露出上半身）时，torso/back 两个
-    角度缺失，只按 head_neck_angle 判；posture 为 None（无人/数据不足）→ UNKNOWN。
+    特殊项 neck_compression（颈压缩，比值，越小越弓背）：方向与其它角度相反，
+    ratio 取倒数（阈值/值）—— 值 <= 阈值 时 ratio >= 1 → SLUMPED，其余逻辑
+    （<= 0.8 恢复、迟滞带保持）与其它角度完全一致。
+
+    只对当前可见的特征判断：髋不可见（人只露出上半身）时，torso/back 两个
+    角度缺失，只按 head_neck_angle / neck_compression 判；posture 为 None
+    （无人/数据不足）→ UNKNOWN。
 
     迟滞带内默认 GOOD（fail-safe：没有充分证据时不打扰用户；与 StillnessDecision
     的"未证实不判静止"方向相反但同理）。
 
-    三个阈值是起始猜测，用实际画面（--debug 看角度读数）标定后调整。
+    四个阈值是起始猜测（neck_compression 的 0.45 也是），用实际画面
+    （--debug 看角度读数）标定后调整。见 CLAUDE.md「阈值（标定经验）」。
 
-    接口约定（保持稳定，别改签名）：
+    接口约定（保持稳定，别改签名；新增参数只加带默认值的关键字参数）：
         PostureDecision(head_neck_threshold=30.0, torso_threshold=30.0,
-                        back_threshold=25.0, hysteresis_ratio=0.8)
+                        back_threshold=25.0, neck_threshold=0.45,
+                        hysteresis_ratio=0.8)
         update(posture: Optional[dict]) -> PostureState
         posture（只读属性）
     """
 
-    # 角度 dict 的 key -> 对应阈值属性名
+    # 角度 dict 的 key -> (对应阈值属性名, 是否"低于阈值=不良").
+    # 前三者"越大越不良"（ratio = 角度/阈值）；neck_compression 是"越小越弓背"
+    # （ratio = 阈值/角度），迟滞语义保持一致（ratio <= 0.8 = 明显恢复）。
     _ANGLE_TO_THRESHOLD = {
-        'head_neck_angle': 'head_neck_threshold',
-        'torso_angle': 'torso_threshold',
-        'back_curvature': 'back_threshold',
+        'head_neck_angle': ('head_neck_threshold', False),
+        'torso_angle': ('torso_threshold', False),
+        'back_curvature': ('back_threshold', False),
+        'neck_compression': ('neck_threshold', True),
     }
 
     def __init__(self,
                  head_neck_threshold: float = 30.0,
                  torso_threshold: float = 30.0,
                  back_threshold: float = 25.0,
+                 neck_threshold: float = 0.45,
                  hysteresis_ratio: float = 0.8) -> None:
         """
         参数:
             head_neck_threshold: 头前伸角阈值（度）。0 = 头在肩正上方。
             torso_threshold:     躯干前倾角阈值（度）。0 = 身体竖直。
             back_threshold:      背部弯曲角阈值（度）。0 = 背直。
-            hysteresis_ratio:    恢复判 GOOD 的比值（默认 0.8：角度掉到阈值
+            neck_threshold:      颈压缩阈值（比值，无单位；耳-肩竖直间距/肩宽）。
+                                 值 <= 此值判弓背（耸肩+低头压扁间距）。默认 0.45
+                                 是起始猜测：正面摄像头下的"坐直/弓背"读数随取景
+                                 和身体比例变化，用 --debug 标定（见 CLAUDE.md）。
+            hysteresis_ratio:    恢复判 GOOD 的比值（默认 0.8：特征掉到阈值
                                  的 80% 以下才算真正恢复，防止边界抖动）。
         """
         if hysteresis_ratio <= 0 or hysteresis_ratio > 1.0:
             raise ValueError("hysteresis_ratio 必须在 (0, 1] 内")
+        if neck_threshold <= 0:
+            raise ValueError("neck_threshold 必须 > 0")
         self.head_neck_threshold = head_neck_threshold
         self.torso_threshold = torso_threshold
         self.back_threshold = back_threshold
+        self.neck_threshold = neck_threshold
         self.hysteresis_ratio = hysteresis_ratio
         self._posture = PostureState.UNKNOWN
 
@@ -285,12 +308,13 @@ class PostureDecision:
         return self._posture
 
     def update(self, posture: Optional[dict]) -> PostureState:
-        """喂入一帧的坐姿角度，更新并返回当前坐姿状态。
+        """喂入一帧的坐姿特征，更新并返回当前坐姿状态。
 
         参数:
-            posture: PostureFeatures.update() 的返回值（角度 dict，单位：度），
-                     至少含 'head_neck_angle'；髋不可见时缺 'torso_angle' /
-                     'back_curvature'；无人/数据不足时为 None。
+            posture: PostureFeatures.update() 的返回值（特征 dict），至少含
+                     'head_neck_angle'；髋不可见时缺 'torso_angle' /
+                     'back_curvature'；单侧链路时缺 'neck_compression'；
+                     无人/数据不足时为 None。
 
         返回:
             PostureState：GOOD / SLUMPED / UNKNOWN。
@@ -299,12 +323,20 @@ class PostureDecision:
             self._posture = PostureState.UNKNOWN
             return self._posture
 
-        # 对当前可见的角度算 ratio，取最坏（最大）的那个
+        # 对当前可见的特征算 ratio，取最坏（最大）的那个。
+        # 普通角度：ratio = 值/阈值（越大越不良）；
+        # 颈压缩（below_is_bad）：ratio = 阈值/值（越小越弓背），值 <= 0 时按
+        # 无限大处理（头完全压到肩上 = 最大不良），避免除零。
         ratios = []
-        for key, attr in self._ANGLE_TO_THRESHOLD.items():
-            angle = posture.get(key)
-            if angle is not None:
-                ratios.append(angle / getattr(self, attr))
+        for key, (attr, below_is_bad) in self._ANGLE_TO_THRESHOLD.items():
+            value = posture.get(key)
+            if value is not None:
+                threshold = getattr(self, attr)
+                if not below_is_bad:
+                    ratios.append(value / threshold)
+                else:
+                    ratios.append(threshold / value if value > 1e-9
+                                  else float('inf'))
         if not ratios:
             self._posture = PostureState.UNKNOWN
             return self._posture
@@ -404,7 +436,8 @@ def selftest_sedentary() -> None:
 
 def selftest_posture_decision() -> None:
     """合成数据自测 PostureDecision：超限→SLUMPED、恢复→GOOD、迟滞带保持、
-    髋缺失（只有 head_neck）仍能判、无人→UNKNOWN、迟滞带内 UNKNOWN→GOOD。"""
+    髋缺失（只有 head_neck）仍能判、无人→UNKNOWN、迟滞带内 UNKNOWN→GOOD、
+    颈压缩（越小越弓背）超限/恢复/迟滞/除零保护。"""
     # 默认阈值：head_neck 30 / torso 30 / back 25，迟滞 0.8（恢复阈值 = 0.8 × 阈值）
     pd = PostureDecision()
 
@@ -448,6 +481,30 @@ def selftest_posture_decision() -> None:
     pd4.update({'head_neck_angle': 40.0})  # SLUMPED
     assert pd4.update({'head_neck_angle': 26.0}) is PostureState.SLUMPED, \
         "SLUMPED 后回到迟滞带应保持 SLUMPED"
+
+    # 9) 颈压缩（越小越弓背）：0.30 < 默认阈值 0.45 → SLUMPED；0.70 → GOOD
+    pd5 = PostureDecision()
+    assert pd5.update({'neck_compression': 0.30}) is PostureState.SLUMPED, \
+        "颈压缩低于阈值应为 SLUMPED"
+    assert pd5.update({'neck_compression': 0.70}) is PostureState.GOOD, \
+        "颈压缩明显高于阈值应为 GOOD"
+
+    # 10) 颈压缩迟滞带：0.50 → ratio=0.45/0.50=0.9 ∈ [0.8,1) → 保持 SLUMPED
+    pd6 = PostureDecision()
+    pd6.update({'neck_compression': 0.30})  # SLUMPED
+    assert pd6.update({'neck_compression': 0.50}) is PostureState.SLUMPED, \
+        "颈压缩迟滞带内应保持 SLUMPED"
+
+    # 11) 颈压缩 = 0（头完全压到肩上）→ 不除零，按最大不良处理 → SLUMPED
+    pd7 = PostureDecision()
+    assert pd7.update({'neck_compression': 0.0}) is PostureState.SLUMPED, \
+        "颈压缩为 0 应判 SLUMPED"
+
+    # 12) 与其它角度联动：颈压缩正常但 head_neck 超限 → SLUMPED
+    pd8 = PostureDecision()
+    assert pd8.update({'neck_compression': 0.70,
+                       'head_neck_angle': 40.0}) is PostureState.SLUMPED, \
+        "任一特征超限（含颈压缩）应为 SLUMPED"
 
     print("  selftest_posture_decision: OK")
 

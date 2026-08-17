@@ -34,11 +34,13 @@ RMS：偶发的一帧检测抖动/孤点不会把移动量顶上去，只有持�
     reset()
 
     PostureFeatures(visibility_min=0.3)                     躯干姿态角度特征
-    update(pose_result) -> Optional[dict]  {'head_neck_angle', 可选的 'torso_angle'/'back_curvature'}（单位：度）
+    update(pose_result) -> Optional[dict]  {'head_neck_angle', 可选的
+                'torso_angle'/'back_curvature'/'neck_compression'}
+                （角度单位：度；neck_compression 为无单位比值）
         取点：整侧链路优先 —— 两侧都齐用中点，否则优先完整单侧链路，
               最后退回中点法；head_neck 只要耳+肩可算即返回，髋缺失时
-              torso/back 两个 key 不出现（调用方显示 N/A）；耳或肩缺失返回
-              None（详见类内 docstring）
+              torso/back 两个 key 不出现（调用方显示 N/A）；neck_compression
+              需双侧肩都在（算肩宽）才出现；耳或肩缺失返回 None（详见类内 docstring）
 """
 
 from __future__ import annotations
@@ -322,10 +324,12 @@ ANGLE_LEGEND = [
     "  torso   = shoulder->hip  vs vertical",
     "  neck    = ear->shoulder  vs vertical",
     "  back    = 180 - fold angle at shoulder",
+    "  head    = ear-shoulder vertical gap / shoulder width",
+    "           (smaller = head dropped / hunched)",
 ]
 
 class PostureFeatures:
-    """从单帧 pose 里计算三个坐姿角度（单位：度），供坐姿识别/展示。
+    """从单帧 pose 里计算三个坐姿角度 + 一个颈压缩比值，供坐姿识别/展示。
 
     三个角度（都用图片平面里的归一化坐标 (x, y) 计算，量纲无关，跨摄像头可复用）：
         torso_angle      躯干倾角：肩中→髋中向量 与竖直轴 (0,1) 的夹角。
@@ -335,11 +339,21 @@ class PostureFeatures:
         back_curvature   背部弯曲度：耳-肩-髋 三点折线在肩处的内角相对 180°
                          的偏折（180 − 内角）。0 = 耳肩髋基本共线（背直），
                          越大弓背越明显（低头/驼背时折线向内折叠）。依赖髋点。
+        neck_compression 颈压缩：耳-肩**竖直间距** ÷ 肩宽（比值，无单位）。
+                         0 = 耳与肩同高（头完全压到肩上），越大 = 头越在肩
+                         正上方。只需耳+肩+双侧肩（算肩宽），不依赖髋。
+
+    为什么有 neck_compression：正面摄像头下"耸肩+低头"式前弓背在图像平面里
+    几乎不改变 x/y —— torso/back/head_neck 三个角度在正面投影都贴 0（见本模块
+    开头 "局限" 段），这是现有角度抓不到前弓背的原因。弓背时唯一明显的正面
+    信号是耳-肩竖直间距被压缩（肩耸起、头下沉），neck_compression 就是量化
+    这个压缩的：它不依赖髋，坐着髋被桌子挡掉时依然可算 —— 恰恰是"坐着弓背"
+    最需要的场景。默认阈值等起始值在 decision.py 标定（见 CLAUDE.md）。
 
     依赖髋点的 torso_angle / back_curvature 在髋不可见（人只露出上半身、
-    髋在画面外）时算不出：update() 返回的 dict 只含 head_neck_angle，
-    缺失的 key 表示 N/A（调用方显示 N/A，不要当 0）。head_neck_angle
-    只需耳+肩，所以髋缺失时依然能算并显示。
+    髋在画面外）时算不出：update() 返回的 dict 不含这两个 key；缺失的 key
+    表示 N/A（调用方显示 N/A，不要当 0）。head_neck_angle 只需耳+肩，
+    neck_compression 只需耳+肩+双侧肩，髋缺失时依然能算并显示。
 
     取点策略（整侧链路优先）：
         两侧耳/肩/髋都可见 → 用两侧中点（最稳定，正对摄像头默认路径）；
@@ -347,17 +361,20 @@ class PostureFeatures:
             常被遮挡，混用两侧中点会把角度算歪）；
         都没有完整链路但点数够 → 退回中点法（耳取可见度最高的那一只 +
             肩/髋取中点，耳部可见度门控沿用本模块风格）。
+        单侧链路时无双侧肩，肩宽算不出 → neck_compression 缺失（N/A）。
 
     局限：正面摄像头在图像平面里主要反映左右倾斜和前伸，侧向弓背/低头只能
-    部分体现。这些角度作为特征先落地、显示，供后续换视角更好的摄像头或做
-    坐姿分类时使用。
+    部分体现；neck_compression 补上了"耸肩+低头"式前弓背，但仍有残留盲区
+    （纯前倾、侧身弓背）。这些特征作为特征先落地、显示，供后续换视角更好的
+    摄像头或做坐姿分类时使用。
 
     接口约定（保持稳定，别改签名）：
         PostureFeatures(visibility_min=0.3)
         update(pose_result: Optional[dict]) -> Optional[dict]
-            返回 {'head_neck_angle':°, 髋可见时另含 'torso_angle':°,
-                  'back_curvature':°}，torso/back 缺失=髋不可见（N/A）；
-            耳或肩缺失返回 None。
+            返回 {'head_neck_angle':°, 可选的 'neck_compression'（比值）、
+                  髋可见时另含 'torso_angle':° / 'back_curvature':°}，
+                  torso/back 缺失=髋不可见、neck_compression 缺失=单侧链路
+                  无肩宽（N/A）；耳或肩缺失返回 None。
     """
 
     def __init__(self, visibility_min: float = 0.3) -> None:
@@ -368,7 +385,7 @@ class PostureFeatures:
         self.visibility_min = visibility_min
 
     def update(self, pose_result: Optional[dict]) -> Optional[dict]:
-        """喂入一帧 pose 结果，返回三个躯干姿态角度（度）。
+        """喂入一帧 pose 结果，返回躯干姿态角度 + 颈压缩（度 / 比值）。
 
         参数:
             pose_result: pose_estimation.detect_pose() 的返回值，结构为
@@ -377,7 +394,8 @@ class PostureFeatures:
 
         返回:
             dict 至少含 'head_neck_angle'（耳+肩可算即返回）；
-            髋可见时附加 'torso_angle' 与 'back_curvature'（key 缺失表示该
+            'neck_compression' 双侧肩都在时附加（单侧链路无肩宽则缺失）；
+            髋可见时另附 'torso_angle' / 'back_curvature'（key 缺失表示该
             帧髋部不可见，调用方应显示 N/A 而不是把它当 0）；
             None 表示耳或肩缺失，任何角度都算不出（无人 / 数据不足）。
         """
@@ -388,17 +406,20 @@ class PostureFeatures:
         if not landmarks:
             return None
 
-        # 1) 按"整侧链路优先"选出耳/肩/髋三点
+        # 1) 按"整侧链路优先"选出耳/肩/髋三点 + 肩宽
         sel = self._select_points(landmarks)
         if sel is None:
             return None
         ear, shoulder, hip = sel['ear'], sel['shoulder'], sel['hip']
 
-        # 2) 角度计算。head_neck 只依赖耳+肩；torso/back 依赖髋。
-        #    hip 为 None（髋不可见）时只返回 head_neck_angle，key 缺失表示 N/A。
+        # 2) 特征计算。head_neck 只依赖耳+肩；neck_compression 只依赖
+        #    耳+肩+肩宽（不依赖髋）；torso/back 依赖髋。缺失的 key = N/A。
         result = {
             'head_neck_angle': self._angle_from_vertical(ear, shoulder),
         }
+        nc = self._neck_compression(ear, shoulder, sel['shoulder_width'])
+        if nc is not None:
+            result['neck_compression'] = nc
         if hip is not None:
             result['torso_angle'] = self._angle_from_vertical(shoulder, hip)
             result['back_curvature'] = self._fold_angle(ear, shoulder, hip)
@@ -409,11 +430,12 @@ class PostureFeatures:
     def _select_points(self, landmarks: list) -> Optional[dict]:
         """从 landmarks 里提取可见的躯干姿态点，并决定用哪侧/哪个点。
 
-        提取并缓存本帧所有可见点到 self._pts（供内部各方法使用）；
-        再按"整侧链路优先"选出参与角度计算的三点。
+        再按"整侧链路优先"选出参与角度计算的三点，同时给出肩宽
+        （neck_compression 的归一化尺度，双侧肩都在才可算）。
 
         返回:
-            {'ear': Point, 'shoulder': Point, 'hip': Point}
+            {'ear': Point, 'shoulder': Point, 'hip': Point | None,
+             'shoulder_width': float | None}
             或 None（数据不足）。
         """
         # 1) 提取本帧所有可见点（按 visibility_min 门控）
@@ -445,10 +467,17 @@ class PostureFeatures:
             hip = self._avg(pts, HIP_IDS)
 
         # ear / shoulder 必须可见；hip 允许缺失（人只露出上半身/髋在画面外时，
-        # head_neck_angle 仍可算，只有 torso/back 无法算 —— 见 update()）。
+        # head_neck_angle / neck_compression 仍可算，只有 torso/back 无法算）。
         if ear is None or shoulder is None:
             return None
-        return {"ear": ear, "shoulder": shoulder, "hip": hip}
+
+        # 肩宽：双侧肩（5/6）都在才可算；单侧链路（L/R）无肩宽 → None（N/A）。
+        shoulder_width = None
+        if 5 in pts and 6 in pts:
+            shoulder_width = math.hypot(pts[6][0] - pts[5][0],
+                                        pts[6][1] - pts[5][1])
+        return {"ear": ear, "shoulder": shoulder, "hip": hip,
+                "shoulder_width": shoulder_width}
 
     @staticmethod
     def _choose_chain_side(pts: dict) -> Optional[str]:
@@ -520,6 +549,23 @@ class PostureFeatures:
         cos = max(-1.0, min(1.0, cos))  # 数值容差
         angle = math.degrees(math.acos(cos))
         return 180.0 - angle
+
+    @staticmethod
+    def _neck_compression(ear: Point, shoulder: Point,
+                          shoulder_width: Optional[float]) -> Optional[float]:
+        """颈压缩：耳-肩**竖直间距** ÷ 肩宽（无单位比值，越小越弓背）。
+
+        竖直间距 = |shoulder.y − ear.y|（归一化坐标 y 向下；耳在肩上方时
+        即"头高出肩多少"）。用肩宽归一化 = 以本人身体尺度为参照，正面摄像头
+        下对"耸肩+低头"式前弓背敏感，且不依赖髋（坐着髋被桌子挡也能算）。
+        肩宽算不出（单侧链路）→ 返回 None（= N/A）。
+        间距为 0（耳与肩同高 = 头完全压到肩上）→ 返回 0.0（最大压缩，
+        decision 层按超限处理，不会除零）。
+        """
+        if shoulder_width is None or shoulder_width < 1e-9:
+            return None
+        gap = abs(shoulder[1] - ear[1])
+        return gap / shoulder_width
 
 
 # ---------------------------------------------------------------------------
@@ -609,17 +655,19 @@ def selftest_movement() -> None:
 
 
 def selftest_posture() -> None:
-    """合成数据自测 PostureFeatures：竖直≈0、前伸>0、髋缺失→N/A、点缺失→None。"""
+    """合成数据自测 PostureFeatures：竖直≈0、前伸>0、髋缺失→N/A、点缺失→None、
+    颈压缩对弓背敏感（竖直 0.75 / 弓背 0.35）、单侧链路无肩宽→N/A。"""
     post = PostureFeatures()
 
-    # 1) 竖直站立：耳/肩/髋同竖线 → 三个角都 ≈ 0
-    upright = {3: (0.5, 0.2), 4: (0.5, 0.2),
-               5: (0.5, 0.35), 6: (0.5, 0.35),
-               11: (0.5, 0.8), 12: (0.5, 0.8)}
+    # 1) 竖直站立：耳/肩/髋同竖线 → 三个角都 ≈ 0；颈压缩 = 0.75（肩宽 0.2）
+    upright = {3: (0.45, 0.2), 4: (0.55, 0.2),
+               5: (0.4, 0.35), 6: (0.6, 0.35),
+               11: (0.45, 0.8), 12: (0.55, 0.8)}
     r = post.update(_make_pose(upright))
     assert r is not None, "竖直场景不应返回 None"
     for key in ("head_neck_angle", "torso_angle", "back_curvature"):
         _assert_close(r[key], 0.0, 1e-6, f"{key} 竖直应为 0")
+    _assert_close(r["neck_compression"], 0.75, 1e-6, "竖直颈压缩应为 0.75")
 
     # 2) 头前伸：耳向右平 0.15（dx=0.15, dy=0.15）→ head_neck ≈ 45°
     lean = {3: (0.65, 0.2), 4: (0.65, 0.2),
@@ -629,20 +677,39 @@ def selftest_posture() -> None:
     assert r is not None
     _assert_close(r["head_neck_angle"], 45.0, 0.5, "head_neck 应为 45°")
 
-    # 3) 单侧链路：只有左耳+左肩+左髋 → 仍能算，竖直 → 0
+    # 3) 单侧链路：只有左耳+左肩+左髋 → 仍能算，竖直 → 0；
+    #    无双侧肩（无肩宽）→ neck_compression 缺失（= N/A）
     left_only = {3: (0.5, 0.2), 5: (0.5, 0.35), 11: (0.5, 0.8)}
     r = post.update(_make_pose(left_only))
     assert r is not None, "单侧链路不应返回 None"
     for key in ("head_neck_angle", "torso_angle", "back_curvature"):
         _assert_close(r[key], 0.0, 1e-6, f"单侧竖直 {key} 应为 0")
+    assert 'neck_compression' not in r, \
+        "单侧链路无双侧肩（无肩宽），neck_compression 应为 N/A（缺失）"
 
-    # 4) 髋不可见：只剩耳+肩 → 只有 head_neck，torso/back 缺失（= N/A）
-    upper = {3: (0.5, 0.2), 4: (0.5, 0.2), 5: (0.5, 0.35), 6: (0.5, 0.35)}
+    # 4) 髋不可见：只剩耳+肩 → head_neck 仍可算、torso/back 缺失（= N/A）；
+    #    但双侧肩在 → neck_compression 可算（正面弓背信号，不依赖髋）。
+    #    注：髋不可见时走到 "MID" 分支，耳取单只（_pick_best_ear），两耳故意
+    #    居中放置避免单耳的横向偏移干扰 head_neck 断言（颈压缩只看竖直间距，
+    #    不受影响）。
+    upper = {3: (0.5, 0.2), 4: (0.5, 0.2),
+             5: (0.4, 0.35), 6: (0.6, 0.35)}
     r = post.update(_make_pose(upper))
     assert r is not None, "髋不可见时 head_neck 仍应可算"
-    assert set(r.keys()) == {"head_neck_angle"}, \
-        f"髋不可见时应只有 head_neck_angle，实际 {sorted(r.keys())}"
+    assert set(r.keys()) == {"head_neck_angle", "neck_compression"}, \
+        f"髋不可见时应只有 head_neck+neck_compression，实际 {sorted(r.keys())}"
     _assert_close(r["head_neck_angle"], 0.0, 1e-6, "上半身竖直 head_neck 应为 0")
+    _assert_close(r["neck_compression"], 0.75, 1e-6, "上半身竖直颈压缩应为 0.75")
+
+    # 4b) 弓背（耸肩+低头，髋不可见）：头下沉、肩微抬 → 颈压缩变小
+    #     （竖直 0.75 → 弓背 0.35），低于 decision 默认阈值 0.45
+    hunched = {3: (0.5, 0.30), 4: (0.5, 0.30),
+               5: (0.4, 0.37), 6: (0.6, 0.37)}
+    r = post.update(_make_pose(hunched))
+    assert r is not None
+    _assert_close(r["neck_compression"], 0.35, 1e-6, "弓背颈压缩应约 0.35")
+    assert r["neck_compression"] < 0.45, \
+        f"弓背颈压缩应低于 decision 默认阈值 0.45，实际 {r['neck_compression']:.3f}"
 
     # 5) 耳或肩缺失（只剩髋）→ None
     assert post.update(_make_pose({11: (0.5, 0.8), 12: (0.5, 0.8)})) is None
