@@ -22,10 +22,13 @@
 - 依赖：`opencv-python`、`numpy`、`onnxruntime`（模型推理用）
 - 模型文件 `end2end.onnx`（rtmpose-s）：见下方「模型文件」
 
-> 本机建议用 `D:\python3.14.2\python.exe`（已装好 cv2/numpy/onnxruntime）。缺依赖时：
-> ```bash
-> D:/python3.14.2/python.exe -m pip install onnxruntime
-> ```
+安装依赖（用你自己环境里的 Python）：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+下面命令里的 `python` 都指这个装好依赖的解释器。想用虚拟环境隔离，可先 `python -m venv .venv` 激活后再装。
 
 ## 模型文件
 
@@ -43,7 +46,7 @@ https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-s_simcc-body
 
 ## 快速开始
 
-在 `rtm_demo/` 目录下运行。下面命令里的 `python` 指上面那个已装好依赖的解释器。
+在 `rtm_demo/` 目录下运行。命令里的 `python` 指装了依赖的解释器（见「环境要求」）。
 
 ### 桌面版
 
@@ -55,13 +58,25 @@ python main_demo.py --no-skeleton           # 不画骨架
 python main_demo.py --selftest              # 合成数据自测各层（不碰摄像头/模型）
 ```
 
-### Web 版（本机 / 局域网）
+### Web 版（本机体验）
 
 ```bash
 python web_demo.py --port 8080
 ```
 
-浏览器打开 `http://127.0.0.1:8080`，授权摄像头即可。页面支持手机/电脑等任意设备的浏览器。
+本机浏览器打开 `http://127.0.0.1:8080`，授权摄像头即可。`127.0.0.1` 是本机回环地址，**只有你这台电脑能访问**。
+
+### Web 版（局域网：同一 WiFi 下的其他设备）
+
+服务默认绑定 `0.0.0.0`，局域网内其他设备（手机 / 电脑）打开：
+
+```
+http://<你这台电脑的局域网IP>:8080
+```
+
+找局域网 IP：命令行运行 `ipconfig`，看「无线局域网适配器 WLAN → IPv4 地址」（形如 `192.168.x.x`）。
+
+> ⚠️ **纯 HTTP 下非本机地址不是安全上下文，浏览器会拒绝摄像头**：局域网设备打开页面只能看到界面，用不了自己的摄像头。要让别人用自己的摄像头，必须走 HTTPS，见下一节「公网演示」。
 
 ### Web 版（公网演示：让别人用自己的摄像头）
 
@@ -111,6 +126,7 @@ python web_demo.py --port 8080
 rtm_demo/
 ├── main_demo.py          # 桌面版入口：装配各层、跑主循环
 ├── web_demo.py           # Web 版入口：浏览器摄像头 → /analyze → 回关键点+状态 JSON
+├── requirements.txt      # Python 依赖（pip install -r requirements.txt）
 ├── capture.py            # 图像输入：FrameSource / CameraCapture
 ├── pose_estimation.py    # RTMPose 推理：17 个 COCO 关键点
 ├── features.py           # 特征：移动量、坐姿角度
