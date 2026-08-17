@@ -18,8 +18,8 @@ pose_estimation / features / decision 整条判定链完全复用，核心算法
 浏览器 canvas 画，COCO 连线与 output.py 保持一致。）
 
 公网访问 / HTTPS：
-    浏览器 getUserMedia 要求"安全上下文"（HTTPS 或 localhost）。本地用
-    http://127.0.0.1:8080 即可；让局域网外的人用自己的摄像头，推荐
+    浏览器 getUserMedia 要求"安全上下文"（HTTPS 或 localhost）。本机直接
+    打开对应端口即可；让局域网外的人用自己的摄像头，推荐
     Cloudflare 快速隧道（自动带 HTTPS）：
         cloudflared tunnel --url http://localhost:8080
     会得到一个 https://xxxx.trycloudflare.com 地址，发给他打开，授权摄像头即可。
@@ -38,7 +38,7 @@ pose_estimation / features / decision 整条判定链完全复用，核心算法
 
 用法（在 rtm_demo/ 目录下运行）：
     python web_demo.py --port 8080
-    浏览器打开 http://127.0.0.1:8080 ，授权摄像头即可；Ctrl+C 退出。
+    浏览器打开页面并授权摄像头即可；Ctrl+C 退出。
     首个访问者的第一帧会初始化 pose 检测器（约 1~2s），之后正常。
 """
 
@@ -479,7 +479,6 @@ def main() -> None:
 
     print("[web] 谁打开页面，就用谁的摄像头（浏览器采集帧 POST /analyze 识别，骨架本地画）")
     print(f"[web] 监听 {args.host}:{args.port}")
-    print(f"[web]   本机:    http://127.0.0.1:{args.port}/")
     ip = _lan_ip()
     if args.host in ("0.0.0.0", "::") and ip:
         print(f"[web]   局域网:  http://{ip}:{args.port}/   （注意：纯 HTTP 下浏览器会拒绝摄像头，只能看页面）")
