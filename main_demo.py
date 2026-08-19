@@ -6,6 +6,7 @@
     python main_demo.py --camera 0 --debug                 # 摄像头，debug 画走势图
     python main_demo.py --camera 0 --duration-limit 1200 --posture-duration-limit 300  # 生产阈值
     python main_demo.py --no-skeleton                      # 不画骨架（只想看数字/省 CPU）
+    python main_demo.py --perf-log                         # 性能采集：每 30 帧写一行 CPU/RSS/推理耗时到 CSV
     python main_demo.py --selftest                          # 合成数据自测（不碰摄像头/mediapipe）
 
 ESC 退出。首帧较慢（惰性初始化 pose 检测器），正常。
@@ -33,6 +34,7 @@ from decision import (StillnessDecision,          # noqa: E402
                       PostureDecision, PostureAlert,
                       selftest_posture_decision, selftest_posture_alert)
 from output import FrameRenderer                  # noqa: E402
+from perf_logger import PerfLogger                # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,6 +68,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-skeleton", dest="draw_skeleton", action="store_false",
                    help="不把姿态骨架（关键点+连线）叠到画面上")
     p.set_defaults(draw_skeleton=True)
+    p.add_argument("--perf-log", nargs="?", const="performance_log.csv",
+                   default=None, metavar="PATH",
+                   help="性能采集：每 30 帧写一行 进程CPU/RSS/相对时间戳/该帧推理耗时"
+                        " 到 CSV（默认 performance_log.csv，可指定路径；需已装 psutil）")
     p.add_argument("--selftest", action="store_true",
                    help="用合成数据自测各层，不打开摄像头")
     return p
@@ -99,45 +105,57 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     print("正在初始化 pose 检测器")
     dbg_cnt = 0  # 临时标定用计数器（标定完删除）
-    with src:
-        while True:
-            frame = src.read()
-            if frame is None:
-                break
+    frame_idx = 0  # 性能采集用的帧序号
+    perf = PerfLogger(args.perf_log) if args.perf_log else None
+    try:
+        with src:
+            while True:
+                frame = src.read()
+                if frame is None:
+                    break
 
-            ts = time.monotonic()
+                ts = time.monotonic()
 
-            pose = detect_pose(frame)
-            movement = feats.update(pose, ts)
-            state = dec.update(movement)
-            posture = post.update(pose)
-            posture_state = pdec.update(posture)
-            # 临时标定：--debug 下每 30 帧（约 1s）打印一次坐姿特征（标定完删除）
-            dbg_cnt += 1
-            if args.debug and dbg_cnt % 30 == 0:
-                hn = posture.get('head_neck_angle') if posture else None
-                to = posture.get('torso_angle') if posture else None
-                bc = posture.get('back_curvature') if posture else None
-                nc = posture.get('neck_compression') if posture else None
-                a = lambda v: '--' if v is None else f"{v:.0f}"
-                b = lambda v: '--' if v is None else f"{v:.2f}"
-                print(f"[dbg] ang=(hn:{a(hn)} to:{a(to)} bc:{a(bc)} nc:{b(nc)}) "
-                      f"post={posture_state.value}", flush=True)
-            reminder = alert.update(state, ts)
-            posture_reminder = palert.update(posture_state, ts)
-            if reminder is not None:
-                print(f"[reminder] {reminder}")
-            if posture_reminder is not None:
-                print(f"[posture] {posture_reminder}")
-            ren.draw(frame, state, movement, posture, reminder, pose,
-                     posture_state, posture_reminder,
-                     still_elapsed_sec=alert.elapsed_sec,
-                     slump_elapsed_sec=palert.elapsed_sec)
-            ren.log(state, movement, posture_state)
+                t_pose = time.monotonic()
+                pose = detect_pose(frame)
+                pose_ms = (time.monotonic() - t_pose) * 1000.0
+                if perf is not None and perf.should_sample(frame_idx):
+                    perf.sample(frame_idx, pose_ms=pose_ms)
+                frame_idx += 1
 
-            cv2.imshow("Stillness Demo (RTMPose)", frame)
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
+                movement = feats.update(pose, ts)
+                state = dec.update(movement)
+                posture = post.update(pose)
+                posture_state = pdec.update(posture)
+                # 临时标定：--debug 下每 30 帧（约 1s）打印一次坐姿特征（标定完删除）
+                dbg_cnt += 1
+                if args.debug and dbg_cnt % 30 == 0:
+                    hn = posture.get('head_neck_angle') if posture else None
+                    to = posture.get('torso_angle') if posture else None
+                    bc = posture.get('back_curvature') if posture else None
+                    nc = posture.get('neck_compression') if posture else None
+                    a = lambda v: '--' if v is None else f"{v:.0f}"
+                    b = lambda v: '--' if v is None else f"{v:.2f}"
+                    print(f"[dbg] ang=(hn:{a(hn)} to:{a(to)} bc:{a(bc)} nc:{b(nc)}) "
+                          f"post={posture_state.value}", flush=True)
+                reminder = alert.update(state, ts)
+                posture_reminder = palert.update(posture_state, ts)
+                if reminder is not None:
+                    print(f"[reminder] {reminder}")
+                if posture_reminder is not None:
+                    print(f"[posture] {posture_reminder}")
+                ren.draw(frame, state, movement, posture, reminder, pose,
+                         posture_state, posture_reminder,
+                         still_elapsed_sec=alert.elapsed_sec,
+                         slump_elapsed_sec=palert.elapsed_sec)
+                ren.log(state, movement, posture_state)
+
+                cv2.imshow("Stillness Demo (RTMPose)", frame)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+    finally:
+        if perf is not None:
+            perf.close()  # 正常退出 / ESC / Ctrl+C 都确保 CSV 落盘完整
 
     cv2.destroyAllWindows()
 
