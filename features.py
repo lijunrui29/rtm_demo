@@ -73,12 +73,13 @@ LEG_IDS = (13, 14, 15, 16)
 KNEE_IDS = (13, 14)
 ANKLE_IDS = (15, 16)
 
-# 侧身退化门控（2026-08-19，实拍标定，详见两个类的 docstring）：
-# 侧身时肩宽被投影压扁（正对实测 ~0.56，侧身 0.01~0.21），髋又常不可见，会产出
-# 两个退化值：移动量用塌缩肩宽当尺度放大抖动→误报 MOVING；neck_compression 分母
-# 是肩宽，塌缩后比值爆炸→把坐姿状态锁死 GOOD。SHOULDER_SCALE_MIN_RATIO 管前者，
-# NECK_COMPRESSION_MAX 管后者。都是"视角退化时宁可不判（UNKNOWN/N/A），不乱判"。
-SHOULDER_SCALE_MIN_RATIO = 0.5   # 肩宽兜底尺度 < 0.5×窗口近期中位尺度 → 视角退化，作废
+# 侧身退化门控（2026-08-19 实拍标定，仅剩 NECK_COMPRESSION_MAX）：
+# 侧身时肩宽被投影压扁（正对 ~0.56，侧身 0.01~0.21）、髋又常不可见，会产出退化值：
+# neck_compression 分母是肩宽，塌缩后比值爆炸（实拍 0.5~13.5）→ 把坐姿锁死 GOOD，
+# NECK_COMPRESSION_MAX 把它作废（= N/A），"视角退化时宁可不判（N/A），不乱判"。
+# 移动量也曾用 SHOULDER_SCALE_MIN_RATIO 门控（肩宽塌缩→作废→UNKNOWN），但作废帧
+# 不进窗口、侧身一久窗口排空 → 持续 NO PERSON；而侧身移动量只是偏高（0.045~0.143，
+# 非爆炸），靠调高 still-threshold 兜底更合适 —— 该门控 2026-08-19 已移除（见 CLAUDE.md）。
 NECK_COMPRESSION_MAX = 1.5       # 颈压缩比值超此物理上限 → 视角退化，作废（= N/A）
 
 # 一个点的二维坐标
@@ -166,10 +167,11 @@ class _WindowedMedianExtractor:
 class FeatureExtractor(_WindowedMedianExtractor):
     """从 pose 序列中提取"躯干移动量"特征。
 
-    侧身退化门控（2026-08-19）：髋不可见时尺度退回肩宽，但侧身投影会把肩宽压扁
-    （正对 ~0.56 → 侧身 0.01~0.21），塌缩尺度会把静止抖动放大成 MOVING。此时
-    相对窗口近期中位尺度检查肩宽（见 _shoulder_scale_plausible），视角退化则
-    本帧作废（返回 None → UNKNOWN），宁可不判不乱判。
+    侧身时的行为（2026-08-19 决定）：髋不可见时尺度退回肩宽，但侧身投影把肩宽压扁
+    （正对 ~0.56 → 侧身 0.01~0.21），用塌缩肩宽归一化会把移动量放大（实拍静止侧身
+    0.045~0.143，贴着 MOVING 阈值边）。曾用 SHOULDER_SCALE_MIN_RATIO 门控把这类帧
+    作废（→ UNKNOWN），但作废帧不进窗口、侧身一久持续 NO PERSON，且移动量只是偏高
+    非爆炸——已改回"照常计算、调高 still-threshold 兜底"。见 CLAUDE.md「侧身」。
     """
 
     def __init__(self,
@@ -232,13 +234,6 @@ class FeatureExtractor(_WindowedMedianExtractor):
         if scale is None:
             return None
 
-        # 3b) 侧身退化门控：髋不可见、走肩宽兜底时，若肩宽相对窗口近期尺度塌缩
-        #     （侧身投影把肩宽压扁），塌缩尺度不可信 → 本帧作废（None）。
-        #     宁可不判（UNKNOWN）也不把静止放大成 MOVING（实拍：正对肩宽 ~0.56、
-        #     侧身 0.01~0.21，用塌缩肩宽归一化后静止抖动越过 0.05 阈值）。
-        if not self._has_hip(valid) and not self._shoulder_scale_plausible(scale):
-            return None
-
         # 4) 入窗口，并裁剪掉超时的旧帧
         self._window.append((now, valid, scale))
         self._trim(now)
@@ -271,26 +266,6 @@ class FeatureExtractor(_WindowedMedianExtractor):
                 return _dist(points[5], points[6])
             return None
         return sum(lengths) / len(lengths)
-
-    @staticmethod
-    def _has_hip(points: Dict[int, Point]) -> bool:
-        """本帧髋部点（11/12）是否可见（决定是否走了"肩宽兜底"分支）。"""
-        return any(pid in points for pid in HIP_IDS)
-
-    def _shoulder_scale_plausible(self, scale: float) -> bool:
-        """肩宽兜底尺度是否可信：不得明显小于窗口近期中位尺度。
-
-        侧身投影把肩宽压扁（正对实测 ~0.56 → 侧身 0.01~0.21），若用塌缩后的
-        肩宽当归一化尺度，静止的轻微抖动会被放大成 MOVING（实拍 REPRO 段中位
-        移动量 0.046、最高 0.143，贴着 0.05 阈值乱跳）。用窗口历史尺度做参照：
-        当前肩宽 < SHOULDER_SCALE_MIN_RATIO × 中位尺度 → 判定视角退化 → 不可信。
-        历史不足时（冷启动）先按可信处理，避免引导期误拒；正常静坐时窗口内尺度
-        稳定，比值远高于阈值，不受影响。
-        """
-        scales = [s for _ts, _pts, s in self._window]
-        if len(scales) < 2:
-            return True
-        return scale >= SHOULDER_SCALE_MIN_RATIO * self._median(scales)
 
     def _compute_normalized_movement(self) -> Optional[float]:
         """基于窗口算归一化移动量（供窗口数据已足时调用）。"""
@@ -703,17 +678,15 @@ def selftest_movement() -> None:
     assert m is not None, "髋不可见、肩中点兜底时不应返回 None"
     _assert_close(m, 0.0, 1e-6, "上半身静止移动量应为 0")
 
-    # 7) 侧身退化门控：髋不可见、走肩宽兜底，但肩宽被侧身投影压扁
-    #    （相对窗口近期尺度塌缩）→ 本帧作废（None），不会把静止放大成 MOVING
+    # 7) 侧身（肩宽被投影压扁到 0.06、髋不可见走肩宽兜底）：门控已移除
+    #    （2026-08-19），侧身帧不再作废 → 照常算移动量（返回非 None，值偏大靠
+    #    still-threshold 兜底），不会显示 NO PERSON
     fe = FeatureExtractor(window_seconds=5.0, min_frames=3, min_window_seconds=0.1)
-    front = {5: (0.45, 0.3), 6: (0.65, 0.3)}   # 正对，肩宽 0.20
-    for i in range(5):
-        fe.update(_make_pose(front), timestamp=float(i) * 0.1)
-    assert fe.update(_make_pose(front), timestamp=0.5) is not None, \
-        "正对肩宽稳定，肩宽兜底应正常判"
     side = {5: (0.52, 0.3), 6: (0.58, 0.3)}    # 侧身，肩宽塌缩到 0.06
-    assert fe.update(_make_pose(side), timestamp=0.6) is None, \
-        "侧身肩宽塌缩帧应被门控拒掉（None），避免误报 MOVING"
+    for i in range(5):
+        fe.update(_make_pose(side), timestamp=float(i) * 0.1)
+    m = fe.update(_make_pose(side), timestamp=0.5)
+    assert m is not None, "侧身肩宽塌缩帧不应再被作废，应能算移动量"
 
     print("  selftest_movement: OK")
 
