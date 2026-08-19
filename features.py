@@ -40,7 +40,8 @@ RMS：偶发的一帧检测抖动/孤点不会把移动量顶上去，只有持�
         取点：整侧链路优先 —— 两侧都齐用中点，否则优先完整单侧链路，
               最后退回中点法；head_neck 只要耳+肩可算即返回，髋缺失时
               torso/back 两个 key 不出现（调用方显示 N/A）；neck_compression
-              需双侧肩都在（算肩宽）才出现；耳或肩缺失返回 None（详见类内 docstring）
+              需双侧肩都在（算肩宽）才出现，侧身退化（比值超物理上限）也缺失
+              （N/A）；耳或肩缺失返回 None（详见类内 docstring）
 """
 
 from __future__ import annotations
@@ -71,6 +72,14 @@ POSTURE_IDS = EAR_IDS + SHOULDER_IDS + HIP_IDS
 LEG_IDS = (13, 14, 15, 16)
 KNEE_IDS = (13, 14)
 ANKLE_IDS = (15, 16)
+
+# 侧身退化门控（2026-08-19，实拍标定，详见两个类的 docstring）：
+# 侧身时肩宽被投影压扁（正对实测 ~0.56，侧身 0.01~0.21），髋又常不可见，会产出
+# 两个退化值：移动量用塌缩肩宽当尺度放大抖动→误报 MOVING；neck_compression 分母
+# 是肩宽，塌缩后比值爆炸→把坐姿状态锁死 GOOD。SHOULDER_SCALE_MIN_RATIO 管前者，
+# NECK_COMPRESSION_MAX 管后者。都是"视角退化时宁可不判（UNKNOWN/N/A），不乱判"。
+SHOULDER_SCALE_MIN_RATIO = 0.5   # 肩宽兜底尺度 < 0.5×窗口近期中位尺度 → 视角退化，作废
+NECK_COMPRESSION_MAX = 1.5       # 颈压缩比值超此物理上限 → 视角退化，作废（= N/A）
 
 # 一个点的二维坐标
 Point = Tuple[float, float]
@@ -155,7 +164,13 @@ class _WindowedMedianExtractor:
 
 
 class FeatureExtractor(_WindowedMedianExtractor):
-    """从 pose 序列中提取"躯干移动量"特征。"""
+    """从 pose 序列中提取"躯干移动量"特征。
+
+    侧身退化门控（2026-08-19）：髋不可见时尺度退回肩宽，但侧身投影会把肩宽压扁
+    （正对 ~0.56 → 侧身 0.01~0.21），塌缩尺度会把静止抖动放大成 MOVING。此时
+    相对窗口近期中位尺度检查肩宽（见 _shoulder_scale_plausible），视角退化则
+    本帧作废（返回 None → UNKNOWN），宁可不判不乱判。
+    """
 
     def __init__(self,
                  window_seconds: float = 3.0,
@@ -217,6 +232,13 @@ class FeatureExtractor(_WindowedMedianExtractor):
         if scale is None:
             return None
 
+        # 3b) 侧身退化门控：髋不可见、走肩宽兜底时，若肩宽相对窗口近期尺度塌缩
+        #     （侧身投影把肩宽压扁），塌缩尺度不可信 → 本帧作废（None）。
+        #     宁可不判（UNKNOWN）也不把静止放大成 MOVING（实拍：正对肩宽 ~0.56、
+        #     侧身 0.01~0.21，用塌缩肩宽归一化后静止抖动越过 0.05 阈值）。
+        if not self._has_hip(valid) and not self._shoulder_scale_plausible(scale):
+            return None
+
         # 4) 入窗口，并裁剪掉超时的旧帧
         self._window.append((now, valid, scale))
         self._trim(now)
@@ -249,6 +271,26 @@ class FeatureExtractor(_WindowedMedianExtractor):
                 return _dist(points[5], points[6])
             return None
         return sum(lengths) / len(lengths)
+
+    @staticmethod
+    def _has_hip(points: Dict[int, Point]) -> bool:
+        """本帧髋部点（11/12）是否可见（决定是否走了"肩宽兜底"分支）。"""
+        return any(pid in points for pid in HIP_IDS)
+
+    def _shoulder_scale_plausible(self, scale: float) -> bool:
+        """肩宽兜底尺度是否可信：不得明显小于窗口近期中位尺度。
+
+        侧身投影把肩宽压扁（正对实测 ~0.56 → 侧身 0.01~0.21），若用塌缩后的
+        肩宽当归一化尺度，静止的轻微抖动会被放大成 MOVING（实拍 REPRO 段中位
+        移动量 0.046、最高 0.143，贴着 0.05 阈值乱跳）。用窗口历史尺度做参照：
+        当前肩宽 < SHOULDER_SCALE_MIN_RATIO × 中位尺度 → 判定视角退化 → 不可信。
+        历史不足时（冷启动）先按可信处理，避免引导期误拒；正常静坐时窗口内尺度
+        稳定，比值远高于阈值，不受影响。
+        """
+        scales = [s for _ts, _pts, s in self._window]
+        if len(scales) < 2:
+            return True
+        return scale >= SHOULDER_SCALE_MIN_RATIO * self._median(scales)
 
     def _compute_normalized_movement(self) -> Optional[float]:
         """基于窗口算归一化移动量（供窗口数据已足时调用）。"""
@@ -342,6 +384,8 @@ class PostureFeatures:
         neck_compression 颈压缩：耳-肩**竖直间距** ÷ 肩宽（比值，无单位）。
                          0 = 耳与肩同高（头完全压到肩上），越大 = 头越在肩
                          正上方。只需耳+肩+双侧肩（算肩宽），不依赖髋。
+                         侧身退化时（肩宽被投影压扁，比值超 NECK_COMPRESSION_MAX）
+                         缺失（= N/A），不产生爆炸值把状态锁死。
 
     为什么有 neck_compression：正面摄像头下"耸肩+低头"式前弓背在图像平面里
     几乎不改变 x/y —— torso/back/head_neck 三个角度在正面投影都贴 0（见本模块
@@ -565,7 +609,15 @@ class PostureFeatures:
         if shoulder_width is None or shoulder_width < 1e-9:
             return None
         gap = abs(shoulder[1] - ear[1])
-        return gap / shoulder_width
+        value = gap / shoulder_width
+        # 侧身退化门控（2026-08-19，实拍标定）：侧身投影把肩宽压扁，比值爆炸
+        # （REPRO 段 0.5~13.5，正对才 0.5~0.8），决策层 ratio = 阈值/值 -> 0.03，
+        # 把坐姿状态锁死成 GOOD。比值超 NECK_COMPRESSION_MAX（耳-肩竖直间距大于
+        # 肩宽 1.5 倍，物理上不可能，只能是视角退化）-> 返回 None（= N/A），
+        # 把判断让回仍有效的 head_neck_angle。
+        if value > NECK_COMPRESSION_MAX:
+            return None
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +703,18 @@ def selftest_movement() -> None:
     assert m is not None, "髋不可见、肩中点兜底时不应返回 None"
     _assert_close(m, 0.0, 1e-6, "上半身静止移动量应为 0")
 
+    # 7) 侧身退化门控：髋不可见、走肩宽兜底，但肩宽被侧身投影压扁
+    #    （相对窗口近期尺度塌缩）→ 本帧作废（None），不会把静止放大成 MOVING
+    fe = FeatureExtractor(window_seconds=5.0, min_frames=3, min_window_seconds=0.1)
+    front = {5: (0.45, 0.3), 6: (0.65, 0.3)}   # 正对，肩宽 0.20
+    for i in range(5):
+        fe.update(_make_pose(front), timestamp=float(i) * 0.1)
+    assert fe.update(_make_pose(front), timestamp=0.5) is not None, \
+        "正对肩宽稳定，肩宽兜底应正常判"
+    side = {5: (0.52, 0.3), 6: (0.58, 0.3)}    # 侧身，肩宽塌缩到 0.06
+    assert fe.update(_make_pose(side), timestamp=0.6) is None, \
+        "侧身肩宽塌缩帧应被门控拒掉（None），避免误报 MOVING"
+
     print("  selftest_movement: OK")
 
 
@@ -710,6 +774,15 @@ def selftest_posture() -> None:
     _assert_close(r["neck_compression"], 0.35, 1e-6, "弓背颈压缩应约 0.35")
     assert r["neck_compression"] < 0.45, \
         f"弓背颈压缩应低于 decision 默认阈值 0.45，实际 {r['neck_compression']:.3f}"
+
+    # 4c) 侧身退化：双侧肩可见但肩宽被侧身投影压扁 → neck_compression 爆炸值
+    #     （> NECK_COMPRESSION_MAX）→ 视为 N/A（缺失），不把状态锁死成 GOOD
+    side = {3: (0.52, 0.22), 4: (0.53, 0.22),
+            5: (0.51, 0.35), 6: (0.55, 0.35)}   # 肩宽 0.04，颈压缩比值 ~3.25
+    r = post.update(_make_pose(side))
+    assert r is not None, "侧身退化时 head_neck 仍可算"
+    assert 'neck_compression' not in r, \
+        "侧身肩宽塌缩时 neck_compression 应为 N/A（缺失）"
 
     # 5) 耳或肩缺失（只剩髋）→ None
     assert post.update(_make_pose({11: (0.5, 0.8), 12: (0.5, 0.8)})) is None
