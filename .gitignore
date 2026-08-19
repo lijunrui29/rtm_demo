@@ -1,8 +1,9 @@
 # 模型文件（约 21MB，不提交；README 有下载/导出说明）
 models/
 
-# Claude Code 本地设置（不进仓库）
+# Claude Code 本地设置与说明（不进仓库）
 .claude/
+CLAUDE.md
 
 # Python
 __pycache__/
