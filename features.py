@@ -13,9 +13,12 @@ RMS：偶发的一帧检测抖动/孤点不会把移动量顶上去，只有持�
 过久"的目标：静坐期间的轻微动作不算"在动"。
 
 其中 归一化尺度 优先 = 躯干高度 mean(‖5-11‖, ‖6-12‖)；髋部点（11/12）
-全部不可见时（人只露出上半身）退化为 肩宽 ‖5-6‖（单位与 landmarks 一致，
-都是归一化坐标）。归一化后 movement 的量纲是"尺度（躯干高度或肩宽）的比例"：
-0.05 表示平均移动了 5%，这样阈值对摄像头距离、人体远近不敏感，可以跨场景复用。
+全部不可见时（人只露出上半身）退化为 max(肩宽 ‖5-6‖, 耳-肩竖直间距)——侧身投影
+会把肩宽压扁（正对 ~0.56 → 侧身 0.01~0.21），用塌缩肩宽当尺度会把静止移动量放大
+成 MOVING；耳-肩竖直间距近似垂直、侧身不塌缩（还 ~0.45），取两者较大者兜底
+（单位与 landmarks 一致，都是归一化坐标）。归一化后 movement 的量纲是
+"尺度（躯干高度/肩宽/耳-肩间距）的比例"：0.05 表示平均移动了 5%，这样阈值对
+摄像头距离、人体远近不敏感，可以跨场景复用。
 
 为什么不用"相邻帧之间的平均欧氏距离"（最初想法）：
     - 慢速连续位移：每一帧之间的差都很小，人会"悄悄地移动"，相邻帧差却始终很小；
@@ -167,11 +170,12 @@ class _WindowedMedianExtractor:
 class FeatureExtractor(_WindowedMedianExtractor):
     """从 pose 序列中提取"躯干移动量"特征。
 
-    侧身时的行为（2026-08-19 决定）：髋不可见时尺度退回肩宽，但侧身投影把肩宽压扁
-    （正对 ~0.56 → 侧身 0.01~0.21），用塌缩肩宽归一化会把移动量放大（实拍静止侧身
-    0.045~0.143，贴着 MOVING 阈值边）。曾用 SHOULDER_SCALE_MIN_RATIO 门控把这类帧
-    作废（→ UNKNOWN），但作废帧不进窗口、侧身一久持续 NO PERSON，且移动量只是偏高
-    非爆炸——已改回"照常计算、调高 still-threshold 兜底"。见 CLAUDE.md「侧身」。
+    侧身时的行为（2026-08-19 决定）：髋不可见时尺度兜底用 max(肩宽, 耳-肩竖直间距)。
+    侧身投影把肩宽压扁（正对 ~0.56 → 侧身 0.01~0.21），若退回纯肩宽，塌缩尺度会把
+    静止移动量放大成 MOVING（实拍侧身 0.045~0.143，几乎全是 MOVING）；耳-肩竖直间距
+    近似垂直、侧身不塌缩，取大者兜底可让侧身移动量回到正常量级（偶发跳 MOVING 用
+    still-threshold 兜底）。曾试过门控作废（→ UNKNOWN，侧身一久持续 NO PERSON）已移除。
+    见 CLAUDE.md「侧身」。
     """
 
     def __init__(self,
@@ -222,8 +226,8 @@ class FeatureExtractor(_WindowedMedianExtractor):
         if not landmarks:
             return None
 
-        # 1) 提取本帧有效的躯干点坐标
-        valid = self._extract_valid(landmarks, TAP_IDS)
+        # 1) 提取本帧有效的躯干点坐标 + 耳朵（耳-肩间距参与髋缺失时的兜底尺度）
+        valid = self._extract_valid(landmarks, TAP_IDS + EAR_IDS)
 
         # 2) 有效点太少 → 本帧作废，不入窗口
         if len(valid) < self.min_valid_points:
@@ -248,12 +252,14 @@ class FeatureExtractor(_WindowedMedianExtractor):
 
     @staticmethod
     def _frame_scale(points: Dict[int, Point]) -> Optional[float]:
-        """一帧的归一化尺度（长度单位）：优先躯干高度，髋部不可见时用肩宽兜底。
+        """一帧的归一化尺度（长度单位）：优先躯干高度，髋不可见时用 max(肩宽, 耳-肩距)。
 
         躯干高度 = mean(‖5-11‖, ‖6-12‖)，只统计两点都有效的侧；
-        髋部点（11/12）全部不可见时，退回 mean(‖5-6‖, ‖6-5‖) = ‖5-6‖。
-        这是为了兼容"只露出上半身"的场景（人坐着/画面只框到胸口），
-        否则髋部永远不可见 → 每帧都被丢弃 → 永远显示"无人/数据不足"。
+        髋部点（11/12）全部不可见时退回 max(肩宽 ‖5-6‖, 耳-肩竖直间距)：
+        侧身投影把肩宽压扁（正对 ~0.56 → 侧身 0.01~0.21），塌缩尺度会把静止
+        移动量放大成 MOVING；耳-肩竖直间距近似垂直、侧身不塌缩（~0.45），取大者
+        兜底。这是为了兼容"只露出上半身"的场景（人坐着/画面只框到胸口），否则
+        髋部永远不可见 → 每帧都被丢弃 → 永远显示"无人/数据不足"。
         """
         lengths = []
         if 5 in points and 11 in points:
@@ -261,10 +267,22 @@ class FeatureExtractor(_WindowedMedianExtractor):
         if 6 in points and 12 in points:
             lengths.append(_dist(points[6], points[12]))
         if not lengths:
-            # 髋部不可见 → 肩宽兜底（需要同侧肩+髋成对时用躯干高，这里退化为单侧肩距）
+            # 髋部不可见 → 肩宽与耳-肩竖直间距取较大者（耳缺失时退回纯肩宽）
+            w = None
             if 5 in points and 6 in points:
-                return _dist(points[5], points[6])
-            return None
+                w = _dist(points[5], points[6])
+            gap = None
+            s_ys = [points[pid][1] for pid in SHOULDER_IDS if pid in points]
+            if s_ys:
+                s_mid_y = sum(s_ys) / len(s_ys)
+                gaps = [abs(points[pid][1] - s_mid_y)
+                        for pid in EAR_IDS if pid in points]
+                if gaps:
+                    gap = max(gaps)
+            candidates = [v for v in (w, gap) if v is not None]
+            if not candidates:
+                return None
+            return max(candidates)
         return sum(lengths) / len(lengths)
 
     def _compute_normalized_movement(self) -> Optional[float]:
@@ -678,15 +696,26 @@ def selftest_movement() -> None:
     assert m is not None, "髋不可见、肩中点兜底时不应返回 None"
     _assert_close(m, 0.0, 1e-6, "上半身静止移动量应为 0")
 
-    # 7) 侧身（肩宽被投影压扁到 0.06、髋不可见走肩宽兜底）：门控已移除
-    #    （2026-08-19），侧身帧不再作废 → 照常算移动量（返回非 None，值偏大靠
-    #    still-threshold 兜底），不会显示 NO PERSON
-    fe = FeatureExtractor(window_seconds=5.0, min_frames=3, min_window_seconds=0.1)
-    side = {5: (0.52, 0.3), 6: (0.58, 0.3)}    # 侧身，肩宽塌缩到 0.06
-    for i in range(5):
-        fe.update(_make_pose(side), timestamp=float(i) * 0.1)
-    m = fe.update(_make_pose(side), timestamp=0.5)
-    assert m is not None, "侧身肩宽塌缩帧不应再被作废，应能算移动量"
+    # 7) 侧身（肩宽被投影压扁、髋不可见）：兜底尺度取 max(肩宽, 耳-肩竖直间距)。
+    #    耳-肩间距侧身不塌缩 → 同一微小位移下，有耳的侧身移动量明显小于只用
+    #    塌缩肩宽（不会把静止放大成 MOVING），且帧不作废（非 None）
+    def side_movement(pts):
+        fe = FeatureExtractor(window_seconds=5.0, min_frames=3, min_window_seconds=0.1)
+        for i in range(5):
+            shift = 0.002 * i
+            moved = {pid: (x + shift, y) for pid, (x, y) in pts.items()}
+            fe.update(_make_pose(moved), timestamp=float(i) * 0.1)
+        last = {pid: (x + 0.008, y) for pid, (x, y) in pts.items()}
+        return fe.update(_make_pose(last), timestamp=0.5)
+
+    no_ear = {5: (0.52, 0.3), 6: (0.58, 0.3)}        # 无耳：兜底 = 肩宽 0.06（塌缩）
+    with_ear = {3: (0.55, 0.08), 4: (0.55, 0.08),    # 有耳：兜底 = 耳-肩距 0.22
+                5: (0.52, 0.3), 6: (0.58, 0.3)}
+    m_no_ear = side_movement(no_ear)
+    m_ear = side_movement(with_ear)
+    assert m_no_ear is not None and m_ear is not None, "侧身帧应能算移动量"
+    assert m_ear < m_no_ear * 0.6, \
+        f"耳-肩兜底应明显压低侧身移动量（有耳 {m_ear:.4f} vs 无耳 {m_no_ear:.4f}）"
 
     print("  selftest_movement: OK")
 
