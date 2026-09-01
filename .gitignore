@@ -11,3 +11,5 @@ __pycache__/
 
 # 本地测试临时文件
 *.log
+# --perf-log 的输出（单次测量快照，不提交）
+performance_log.csv

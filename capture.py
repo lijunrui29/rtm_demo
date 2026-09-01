@@ -16,6 +16,7 @@ capture 层：只负责拿到一帧一帧的图像，不关心图像来自哪里
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import time
 from typing import Optional
 
 import cv2
@@ -83,6 +84,15 @@ class FrameSource(ABC):
         """释放 self._cap 指向的底层资源。"""
 
 
+# Windows 摄像头后端依次尝试顺序：DSHOW → MSMF → 平台默认（None）。
+# MSMF 常见"能打开但一直抓不到帧"（cap_msmf.cpp 报 -1072875772）的毛病，
+# DSHOW 一般更稳；非 Windows 上 DSHOW/MSMF 打开会失败，自然落到平台默认。
+_CAMERA_BACKENDS = (cv2.CAP_DSHOW, cv2.CAP_MSMF, None)
+_OPEN_PROBE_RETRIES = 3    # 打开后实抓一帧验证，最多试几次（有的后端 opened() 为真但抓不到）
+_READ_RETRIES = 5          # 读帧瞬时失败重试次数（避免一帧抽风把整条链路当"视频结束"）
+_READ_RETRY_SLEEP = 0.05   # 每次重试前的等待（秒）
+
+
 class CameraCapture(FrameSource):
     """本地摄像头图像源（目前用 OpenCV 的 cv2.VideoCapture）。"""
 
@@ -94,21 +104,37 @@ class CameraCapture(FrameSource):
         self.height = height
 
     def _open(self):
-        cap = cv2.VideoCapture(self.index)
-        if not cap.isOpened():
+        for backend in _CAMERA_BACKENDS:
+            try:
+                cap = (cv2.VideoCapture(self.index, backend)
+                       if backend is not None else cv2.VideoCapture(self.index))
+            except Exception:
+                continue
+            if not cap.isOpened():
+                cap.release()
+                continue
+            if self.width:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            if self.height:
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            # 实抓一帧验证：有的后端能打开但一直读不到帧，那种直接弃用换下一个
+            for _ in range(_OPEN_PROBE_RETRIES):
+                ok, _ = cap.read()
+                if ok:
+                    print(f"[capture] 已打开本地摄像头 #{self.index} "
+                          f"(backend={backend if backend is not None else 'default'})")
+                    return cap
             cap.release()
-            print(f"[capture] 打开摄像头失败：编号 {self.index} 不存在或被占用")
-            return None
-        if self.width:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        if self.height:
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        print(f"[capture] 已打开本地摄像头 #{self.index}")
-        return cap
+        print(f"[capture] 打开摄像头失败：编号 {self.index} 不存在或被占用")
+        return None
 
     def _read(self) -> Optional[Frame]:
-        ret, frame = self._cap.read()
-        return frame if ret else None
+        for _ in range(_READ_RETRIES):
+            ret, frame = self._cap.read()
+            if ret:
+                return frame
+            time.sleep(_READ_RETRY_SLEEP)
+        return None
 
     def _release(self) -> None:
         self._cap.release()

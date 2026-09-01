@@ -282,8 +282,16 @@ def _retry_person_crop(frame_bgr: np.ndarray, scores: np.ndarray,
         return None
 
     x1, y1, x2, y2 = bbox
-    bw, bh = x2 - x1, y2 - y1
+    # 防御：缓存框可能越界/退化（numpy 负索引会环绕到帧尾，越界框会切出空图），
+    # 先夹回帧内并淘汰退化框，避免对空图 cvtColor 崩溃。
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
+    if x2 - x1 < 10 or y2 - y1 < 10:
+        return None
     crop = frame_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    bw, bh = x2 - x1, y2 - y1
     crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     crop_tensor = _normalize_to_tensor(
         cv2.resize(crop_rgb, INPUT_SIZE, interpolation=cv2.INTER_LINEAR))
