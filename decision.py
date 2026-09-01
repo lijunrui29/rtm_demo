@@ -18,6 +18,13 @@ decision 层：把 features 层给出的特征映射成状态，再决定"要不
     耸肩+低头会压扁耳-肩竖直间距，正面摄像头也看得到。它和其它角度方向
     相反，ratio 取倒数（阈值/值），其余迟滞语义完全一致。
 
+3) CVA 分级（消费 ErgonomicRiskFeatures 的平滑颅椎角）：
+    CvaRisk 按分级阈值把 CVA 映射为 NORMAL / MILD / MODERATE_SEVERE / SEVERE，
+    阈值默认 55/50/44（Mostafaee et al. 2022 观察性分组，**非临床诊断标准**；
+    本系统用肩点近似 C7，量值需实拍自标定）。CVA 已由 features 层做滑动窗口
+    中位数平滑，这里不额外加迟滞。FSA（前伸肩角）是辅助指标，本层**不读取**
+    —— 只在 CVA 中重度及以上时由 output 层附注显示。
+
 "持续满多久才算数"这类时间规则，由 _DurationAlert 基类的两个子类实现：
     SedentaryAlert 累计"连续静止"时长（消费 StillnessDecision.State）；
     PostureAlert    累计"连续不良坐姿"时长（消费 PostureDecision.PostureState）。
@@ -43,6 +50,11 @@ decision 层：把 features 层给出的特征映射成状态，再决定"要不
     PostureAlert(duration_limit_sec=300.0)               不良坐姿提醒
     update(posture_state, timestamp=None) -> Optional[str]
     elapsed_sec（只读属性）                               当前连续不良坐姿秒数
+
+    CvaLevel 枚举：NORMAL / MILD / MODERATE_SEVERE / SEVERE / UNKNOWN
+    CvaRisk(normal_threshold=55.0, mild_threshold=50.0, severe_threshold=44.0)
+    update(cva_deg: Optional[float]) -> CvaLevel        颅椎角分级（不读 FSA）
+    level（只读属性）
 """
 
 from __future__ import annotations
@@ -391,6 +403,84 @@ class PostureAlert(_DurationAlert):
         return "ACCUM"  # SLUMPED
 
 
+class CvaLevel(enum.Enum):
+    """CVA（颅椎角）风险分级。
+
+    分级阈值来自 Mostafaee et al. 2022 观察性分组，**非临床诊断标准**；
+    本系统用肩点近似 C7（见 features.ErgonomicRiskFeatures），量值需实拍自标定。
+    """
+    NORMAL = "NORMAL"                     # CVA >= 55°
+    MILD = "MILD"                         # 50° <= CVA < 55°
+    MODERATE_SEVERE = "MODERATE_SEVERE"   # 44° <= CVA < 50°
+    SEVERE = "SEVERE"                     # CVA < 44°
+    UNKNOWN = "UNKNOWN"                   # 无有效 CVA（无人/数据不足）
+
+
+class CvaRisk:
+    """CVA 分级（消费 ErgonomicRiskFeatures 的平滑 cva_deg，**不读 FSA**）。
+
+    分级阈值默认 55/50/44（度），来自 Mostafaee et al. 2022 观察性分组：
+        cva >= normal_threshold              -> NORMAL（正常）
+        normal_threshold > cva >= mild_threshold -> MILD（轻度头前伸）
+        mild_threshold > cva >= severe_threshold -> MODERATE_SEVERE（中重度）
+        cva < severe_threshold               -> SEVERE（重度头前伸，建议触发
+                                                 高优先级预警；预警机制暂未实现）
+    说明：文献阈值针对真实 C7-耳连线，本系统用肩点近似 C7，存在稳定系统偏差，
+    **不能直接套用文献阈值** —— 请用 --cva-*-threshold（或构造参数）按实拍标定。
+    CVA 已由 features 层做滑动窗口中位数平滑，等级一般不会单帧跳变，这里不额外
+    加迟滞。
+
+    FSA（前伸肩角）是辅助指标，本层**不读取**：它只由 output 层在 CVA 判定为
+    MODERATE_SEVERE 及以上时附注显示，供报告参考肩部代偿，不参与任何判断。
+
+    接口约定（保持稳定，别改签名）：
+        CvaRisk(normal_threshold=55.0, mild_threshold=50.0,
+                severe_threshold=44.0)
+        update(cva_deg: Optional[float]) -> CvaLevel
+        level（只读属性）
+    """
+
+    def __init__(self,
+                 normal_threshold: float = 55.0,
+                 mild_threshold: float = 50.0,
+                 severe_threshold: float = 44.0) -> None:
+        """
+        参数:
+            normal_threshold:  CVA >= 此值判正常（默认 55°）。
+            mild_threshold:    CVA >= 此值判轻度头前伸（默认 50°）。
+            severe_threshold:  CVA >= 此值判中重度头前伸，更低判重度（默认 44°）。
+        """
+        if not (normal_threshold > mild_threshold > severe_threshold):
+            raise ValueError("CVA 阈值需满足 normal_threshold > mild_threshold "
+                             "> severe_threshold")
+        self.normal_threshold = normal_threshold
+        self.mild_threshold = mild_threshold
+        self.severe_threshold = severe_threshold
+        self._level = CvaLevel.UNKNOWN
+
+    @property
+    def level(self) -> CvaLevel:
+        return self._level
+
+    def update(self, cva_deg: Optional[float]) -> CvaLevel:
+        """喂入一帧的平滑 CVA，更新并返回当前分级。
+
+        cva_deg 为 None（无人 / 从未有有效 CVA）→ UNKNOWN。
+        """
+        if cva_deg is None:
+            self._level = CvaLevel.UNKNOWN
+            return self._level
+        if cva_deg >= self.normal_threshold:
+            self._level = CvaLevel.NORMAL
+        elif cva_deg >= self.mild_threshold:
+            self._level = CvaLevel.MILD
+        elif cva_deg >= self.severe_threshold:
+            self._level = CvaLevel.MODERATE_SEVERE
+        else:
+            self._level = CvaLevel.SEVERE
+        return self._level
+
+
 # ---------------------------------------------------------------------------
 # 自测：纯 stdlib 合成数据，验证久坐计时/锁存逻辑（main_demo.py --selftest 汇总调用）
 # ---------------------------------------------------------------------------
@@ -553,8 +643,39 @@ def selftest_posture_alert() -> None:
     print("  selftest_posture_alert: OK")
 
 
+def selftest_cva_risk() -> None:
+    """合成数据自测 CvaRisk：各级边界（55/50/44，含等号）、None→UNKNOWN、阈值可配、
+    非法阈值顺序报错。"""
+    r = CvaRisk()
+
+    # 1) 分级边界（含等号：>= 阈值归入上级）
+    assert r.update(60.0) is CvaLevel.NORMAL, "60° 应为 NORMAL"
+    assert r.update(55.0) is CvaLevel.NORMAL, "55° 边界应含等号 → NORMAL"
+    assert r.update(54.9) is CvaLevel.MILD, "54.9° 应为 MILD"
+    assert r.update(50.0) is CvaLevel.MILD, "50° 边界应含等号 → MILD"
+    assert r.update(49.9) is CvaLevel.MODERATE_SEVERE, "49.9° 应为 MODERATE_SEVERE"
+    assert r.update(44.0) is CvaLevel.MODERATE_SEVERE, "44° 边界应含等号 → MODERATE_SEVERE"
+    assert r.update(43.9) is CvaLevel.SEVERE, "43.9° 应为 SEVERE"
+    assert r.update(0.0) is CvaLevel.SEVERE, "0° 应为 SEVERE（不除零、不崩溃）"
+    assert r.update(None) is CvaLevel.UNKNOWN, "None 应为 UNKNOWN"
+
+    # 2) 阈值可配（按实拍标定后传入）
+    r2 = CvaRisk(normal_threshold=50.0, mild_threshold=45.0, severe_threshold=40.0)
+    assert r2.update(48.0) is CvaLevel.MILD, "配置后 48° 应为 MILD"
+
+    # 3) 非法阈值顺序应报错
+    try:
+        CvaRisk(normal_threshold=40.0, mild_threshold=45.0, severe_threshold=44.0)
+        raise AssertionError("阈值乱序应抛 ValueError")
+    except ValueError:
+        pass
+
+    print("  selftest_cva_risk: OK")
+
+
 if __name__ == "__main__":
     selftest_sedentary()
     selftest_posture_decision()
     selftest_posture_alert()
+    selftest_cva_risk()
     print("decision selftest: ALL PASSED")

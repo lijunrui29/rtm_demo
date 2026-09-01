@@ -50,8 +50,18 @@ debug 模式：
             文字来自 features.ANGLE_LEGEND（单一来源，output 只渲染），
             不随帧变化、无需参数。
 
-本模块只消费 decision.State/PostureState + float + 四个 dict（posture/久坐文案/
-不良坐姿文案/pose 数据）。
+CVA / FSA 姿态风险指标叠加（新增）：
+    draw_cva_overlay(frame, cva, cva_level) 可选调用（main 在 draw/draw_schema
+    后调用）。cva: ErgonomicRiskFeatures.update() 的返回值；cva_level:
+    decision.CvaRisk.level（CvaLevel 枚举）。在计时行下方画 CVA 主指标
+    （按分级着色）；FSA 是**辅助指标**，仅当 CVA 判定为"中重度"及以上时以
+    更小灰白字附注（标注 aux，含相对趋势），与 CVA 分开呈现、不暗示两者
+    权重相同。CVA 无有效值时显示 `CVA --  N/A`。
+    免责声明：本系统输出的 CVA/FSA 角度指标反映体表姿态模式，不能替代医学
+    影像诊断或临床评估（分级阈值参考 Mostafaee et al. 2022 观察性分组）。
+
+本模块只消费 decision.State/PostureState/CvaLevel + float + 五个 dict
+（posture/久坐文案/不良坐姿文案/pose 数据/CVA-FSA 特征）。
 例外：仅 import features.ANGLE_LEGEND 这一个**数据常量**用于渲染角度说明，
 不 import features 的逻辑/类。
 """
@@ -66,7 +76,7 @@ from typing import Deque, Optional
 import cv2
 import numpy as np
 
-from decision import State, PostureState
+from decision import State, PostureState, CvaLevel
 from features import ANGLE_LEGEND
 
 # 骨架：17 个 COCO 关键点之间怎么连线（RTMPose 输出的 COCO 17 点）。
@@ -115,6 +125,16 @@ _STATUS_COLOR = {
     "na": (150, 150, 150),      # 灰
     "offline": (0, 80, 220),    # 红
     "error": (0, 60, 220),      # 红
+}
+
+# CVA 分级颜色（draw_cva_overlay 用，BGR）：绿=正常、黄=轻度、橙=中重度、
+# 红=重度、灰=未知
+_CVA_LEVEL_COLOR = {
+    CvaLevel.NORMAL: (60, 200, 60),
+    CvaLevel.MILD: (0, 210, 255),
+    CvaLevel.MODERATE_SEVERE: (0, 165, 255),
+    CvaLevel.SEVERE: (0, 60, 220),
+    CvaLevel.UNKNOWN: (180, 180, 180),
 }
 
 
@@ -275,6 +295,43 @@ class FrameRenderer:
         self._draw_angle_legend(frame)
 
         return frame
+
+    # ---------- CVA/FSA 姿态风险指标叠加（2026-09-01 新增） ----------
+
+    def draw_cva_overlay(self, frame: np.ndarray, cva: Optional[dict],
+                         cva_level: Optional[CvaLevel] = None) -> None:
+        """在画面左侧叠加 CVA 主指标 +（仅中重度及以上时的）FSA 辅助行。
+
+        cva: ErgonomicRiskFeatures.update() 的返回值，含
+             'cva_deg'/'cva_valid'/'fsa_deg'/'fsa_valid'/'fsa_trend_deg'。
+        cva_level: decision.CvaRisk.level（CvaLevel 枚举）。
+        CVA 主行画在计时行 (12,112) 下方 (12,140)，按分级着色：
+            NORMAL 绿 / MILD 黄 / MODERATE_SEVERE 橙 / SEVERE 红 / UNKNOWN 灰。
+            cva_deg 为 None（从未可算）→ `CVA --  N/A`（灰）。
+        FSA 是辅助指标：仅当 cva_level 为 MODERATE_SEVERE/SEVERE 且 fsa_deg
+        可显示时，以更小的灰白字画在 (12,162)，标注 aux —— 与 CVA 分开呈现、
+        不暗示两者权重相同（decision 层不读 FSA，这里只做报告附注）。
+        """
+        if cva is None or cva_level is None:
+            return
+
+        color = _CVA_LEVEL_COLOR.get(cva_level, (180, 180, 180))
+        cva_deg = cva.get('cva_deg')
+        cva_line = f"CVA {cva_deg:.1f}°  {cva_level.value}" \
+            if cva_deg is not None else "CVA --  N/A"
+        cv2.putText(frame, cva_line, (12, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+
+        # FSA 辅助行（仅中重度及以上附注；无 fsa 值不画）
+        if cva_level in (CvaLevel.MODERATE_SEVERE, CvaLevel.SEVERE):
+            fsa_deg = cva.get('fsa_deg')
+            if fsa_deg is not None:
+                trend = cva.get('fsa_trend_deg')
+                trend_s = "" if trend is None else f" trend {trend:+.1f}°"
+                fsa_line = f"FSA {fsa_deg:.1f}°{trend_s}  aux"
+                cv2.putText(frame, fsa_line, (12, 162),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1,
+                            cv2.LINE_AA)
 
     # ---------- 骨架叠加 ----------
 

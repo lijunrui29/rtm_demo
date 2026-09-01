@@ -45,6 +45,13 @@ RMS：偶发的一帧检测抖动/孤点不会把移动量顶上去，只有持�
               torso/back 两个 key 不出现（调用方显示 N/A）；neck_compression
               需双侧肩都在（算肩宽）才出现，侧身退化（比值超物理上限）也缺失
               （N/A）；耳或肩缺失返回 None（详见类内 docstring）
+
+    ErgonomicRiskFeatures(window_seconds=3.0, min_frames=5,
+                          min_window_seconds=1.0, visibility_min=0.3)
+    update(pose_result, timestamp=None) -> dict  CVA（颅椎角：耳-肩连线 vs 水平线，
+                越小越前伸）平滑值 + FSA（前伸肩角：上臂 vs 水平线）平滑值与趋势；
+                关键点不足/低置信时维持上一有效值（*_valid=False），不报错、不出 0
+                （C7 用肩点近似，详见类内 docstring）
 """
 
 from __future__ import annotations
@@ -67,6 +74,9 @@ EAR_IDS = (3, 4)
 
 # 肩部点（5 左肩 / 6 右肩）—— 坐姿角度特征用
 SHOULDER_IDS = (5, 6)
+
+# 肘部点（7 左肘 / 8 右肘）—— CVA/FSA（前伸肩角）特征用
+ELBOW_IDS = (7, 8)
 
 # 躯干姿态计算用到的全部关键点：耳 3/4 + 肩 5/6 + 髋 11/12
 POSTURE_IDS = EAR_IDS + SHOULDER_IDS + HIP_IDS
@@ -614,20 +624,218 @@ class PostureFeatures:
 
 
 # ---------------------------------------------------------------------------
+# ErgonomicRiskFeatures：CVA（颅椎角）/ FSA（前伸肩角）姿态风险特征
+# （2026-09-01 新增，纯 stdlib；文献代理指标，需按本系统取景自标定）
+# ---------------------------------------------------------------------------
+
+class ErgonomicRiskFeatures(_WindowedMedianExtractor):
+    """CVA（颅椎角）/ FSA（前伸肩角）姿态风险特征：文献化的头前伸/肩前伸量化指标。
+
+    免责声明：这里输出的角度指标反映**体表姿态模式**（耳/肩/肘关键点在图片
+    平面上的投影几何），**不能替代医学影像诊断或临床评估**。CVA 分级阈值来自
+    Mostafaee et al. 2022 观察性分组，仅作参考，需按本系统的取景/视角自标定。
+
+    指标定义（图片平面，归一化坐标 (x, y)，y 向下）：
+        CVA  颅椎角：耳→肩 连线 与"过肩点的水平线"的夹角（0~90°，
+             竖直耳位 → 90°）。数值越小 = 头越前伸（严重）。
+        FSA  前伸肩角（Lee et al. 2015 思路）：上臂（肩中点→肘中点，肱骨
+             中点必在此线段上）与水平线的夹角（0~90°）。数值越小 = 上臂越
+             接近水平 = 肩部越前伸。**辅助指标**：不参与判断，仅供 CVA 中
+             重度及以上时附注显示（见 decision.CvaRisk / output 层）。
+
+    C7 近似（2026-09-01，思路一）：直接用肩点（5/6，双肩可见取中点、单肩取
+    可见侧）当 C7 代理，**不加偏移修正**。真实 C7（第 7 颈椎）在肩点后方且
+    更靠上，方向偏差稳定但量值不可直接套用文献阈值 —— 本系统阈值必须用实拍
+    样本自标定。将来接入真正的 C7 关键点或换 schema 后，这里需重做。
+
+    时间平滑：CVA/FSA 各自维护滑动窗口（默认 3s），每帧把可算的原始值入窗，
+    输出**中位数**（对单帧检测噪声/抖动鲁棒），防止分级等级单帧跳变。
+    窗口攒够 min_frames 帧 + min_window_seconds 时间跨度才输出平滑值
+    （启动预热阶段返回 None，与 FeatureExtractor 的"数据不足不乱下结论"一致）。
+
+    降级（遮挡/低置信度）：耳/肩/肘任一不足（visibility < visibility_min）时
+    该指标本帧不可算 → **维持上一有效值**并标 *_valid=False（从未有效则 None），
+    不报错、不出 0。CVA 与 FSA 相互独立降级（如肘被桌子挡掉不影响 CVA）。
+
+    接口约定（保持稳定，别改签名）：
+        ErgonomicRiskFeatures(window_seconds=3.0, min_frames=5,
+                              min_window_seconds=1.0, visibility_min=0.3)
+        update(pose_result, timestamp=None) -> dict
+            {'cva_deg', 'cva_valid', 'fsa_deg', 'fsa_valid', 'fsa_trend_deg'}
+        reset()
+    """
+
+    def __init__(self,
+                 window_seconds: float = 3.0,
+                 min_frames: int = 5,
+                 min_window_seconds: float = 1.0,
+                 visibility_min: float = 0.3) -> None:
+        """
+        参数:
+            window_seconds:      滑动窗口时长（秒），CVA/FSA 中位数平滑用。
+            min_frames:          窗口至少攒够多少帧才输出平滑值。
+            min_window_seconds:  窗口内首尾帧的最小时间跨度（秒），数据太稀疏
+                                 时不乱下结论。
+            visibility_min:      某关键点 visibility 低于此值视为无效点。
+        """
+        super().__init__(window_seconds=window_seconds,
+                         min_frames=min_frames,
+                         min_window_seconds=min_window_seconds,
+                         visibility_min=visibility_min,
+                         min_valid_points=2)
+        self._cva_win: deque = deque()   # (timestamp, cva_deg) 原始值
+        self._fsa_win: deque = deque()   # (timestamp, fsa_deg) 原始值
+        self._last = {                   # 上一有效值（降级时维持）
+            'cva_deg': None,
+            'fsa_deg': None,
+            'fsa_trend_deg': None,
+        }
+
+    def reset(self) -> None:
+        """清空窗口与上一有效值，重新开始。"""
+        super().reset()
+        self._cva_win.clear()
+        self._fsa_win.clear()
+        self._last = {'cva_deg': None, 'fsa_deg': None, 'fsa_trend_deg': None}
+
+    def update(self,
+               pose_result: Optional[dict],
+               timestamp: Optional[float] = None) -> dict:
+        """喂入一帧 pose 结果，返回 CVA / FSA 特征。
+
+        参数:
+            pose_result: pose_estimation.detect_pose() 的返回值
+                         {'landmarks': [(x, y, z, visibility) x17], ...}，
+                         未检测到人体时为 None。
+            timestamp:   该帧的单调时间戳（秒），默认 time.monotonic()；
+                         视频回放/自测请传入模拟时间戳（与 FeatureExtractor 同约定）。
+
+        返回:
+            dict，含：
+                cva_deg:       平滑后的 CVA（度，0~90）。本帧可算=新值；
+                               关键点不足/低置信=维持上一有效值；从未有效=None。
+                cva_valid:     本帧 CVA 是否真的算了（False = 维持旧值/降级）。
+                fsa_deg:       平滑后的 FSA（度，0~90），退化语义同 CVA。
+                fsa_valid:     本帧 FSA 是否真的算了。
+                fsa_trend_deg: FSA 相对窗口内最早帧的变化量（度；负 = 上臂
+                               更接近水平 = 肩更前伸）。
+        """
+        now = timestamp if timestamp is not None else time.monotonic()
+
+        cva, fsa = self._compute_frame(pose_result)
+
+        # 能算的帧入窗 → 窗口攒够后输出中位数；否则维持上一有效值（valid=False）
+        cva_out = fsa_out = None
+        cva_valid = fsa_valid = False
+        if cva is not None:
+            self._cva_win.append((now, cva))
+            self._trim_window(self._cva_win, now)
+            if self._win_ready(self._cva_win):
+                cva_out = self._smoothed(self._cva_win)
+                cva_valid = True
+                self._last['cva_deg'] = cva_out
+        if fsa is not None:
+            self._fsa_win.append((now, fsa))
+            self._trim_window(self._fsa_win, now)
+            if self._win_ready(self._fsa_win):
+                fsa_out = self._smoothed(self._fsa_win)
+                fsa_valid = True
+                self._last['fsa_deg'] = fsa_out
+                self._last['fsa_trend_deg'] = self._fsa_trend(self._fsa_win)
+
+        return {
+            'cva_deg': cva_out if cva_valid else self._last['cva_deg'],
+            'cva_valid': cva_valid,
+            'fsa_deg': fsa_out if fsa_valid else self._last['fsa_deg'],
+            'fsa_valid': fsa_valid,
+            'fsa_trend_deg': self._last['fsa_trend_deg'],
+        }
+
+    # ---------- 内部实现 ----------
+
+    @staticmethod
+    def _avg(pts: dict, ids: Tuple[int, ...]) -> Optional[Point]:
+        """取 pts 中 ids 内所有可见点的中点（至少 1 个可见）。"""
+        pts_l = [pts[pid] for pid in ids if pid in pts]
+        if not pts_l:
+            return None
+        if len(pts_l) == 1:
+            return pts_l[0]
+        return ((pts_l[0][0] + pts_l[1][0]) / 2.0,
+                (pts_l[0][1] + pts_l[1][1]) / 2.0)
+
+    @staticmethod
+    def _angle_from_horizontal(a: Point, b: Point) -> float:
+        """向量 a→b 与水平线（x 轴方向）的夹角（度，0~90）。"""
+        dx = b[0] - a[0]
+        dy = b[1] - a[1]
+        return math.degrees(math.atan2(abs(dy), abs(dx)))
+
+    def _compute_frame(self, pose_result: Optional[dict]):
+        """单帧算 CVA / FSA 原始值；对应关键点不足时为 None（各自独立）。"""
+        if pose_result is None:
+            return None, None
+        landmarks = pose_result.get('landmarks')
+        if not landmarks:
+            return None, None
+
+        valid = self._extract_valid(landmarks, EAR_IDS + SHOULDER_IDS + ELBOW_IDS)
+        ear = self._avg(valid, EAR_IDS)
+        shoulder = self._avg(valid, SHOULDER_IDS)   # C7 近似（思路一，无偏移）
+        elbow = self._avg(valid, ELBOW_IDS)
+
+        # 两点重合（退化检测）时角度无意义，按数据不足处理
+        cva = None
+        if ear is not None and shoulder is not None \
+                and _dist(ear, shoulder) > 1e-9:
+            cva = self._angle_from_horizontal(shoulder, ear)
+        fsa = None
+        if shoulder is not None and elbow is not None \
+                and _dist(shoulder, elbow) > 1e-9:
+            fsa = self._angle_from_horizontal(shoulder, elbow)
+        return cva, fsa
+
+    def _trim_window(self, win: deque, now: float) -> None:
+        """按 window_seconds 裁剪窗口内超时的旧帧（CVA/FSA 各自的窗口）。"""
+        cutoff = now - self.window_seconds
+        while win and win[0][0] < cutoff:
+            win.popleft()
+
+    def _win_ready(self, win: deque) -> bool:
+        """窗口是否已攒够帧数 + 时间跨度（与基类 _window_ready 同语义）。"""
+        if len(win) < self.min_frames:
+            return False
+        return win[-1][0] - win[0][0] >= self.min_window_seconds
+
+    def _smoothed(self, win: deque) -> Optional[float]:
+        """窗口内原始值的中位数（平滑用，需已通过 _win_ready）。"""
+        if not win:
+            return None
+        return self._median([v for _t, v in win])
+
+    def _fsa_trend(self, win: deque) -> Optional[float]:
+        """FSA 相对窗口内最早帧的变化量（度）：当前平滑值 − 最早帧原始值。"""
+        if not win:
+            return None
+        return self._smoothed(win) - win[0][1]
+
+
+# ---------------------------------------------------------------------------
 # 自测：纯 stdlib 合成数据，验证各特征计算逻辑（main_demo.py --selftest 汇总调用）
 # ---------------------------------------------------------------------------
 
-def _make_pose(pts: dict) -> dict:
+def _make_pose(pts: dict, vis: float = 1.0) -> dict:
     """构造一帧合成 pose：pts 里的点可见，其余点 visibility=0。
 
     pts: {关键点编号: (x, y)}，x/y 为归一化坐标 0~1。
+    vis: 可见点的统一 visibility（默认 1.0；传 0.1 可模拟遮挡/低置信帧）。
     返回结构与 pose_estimation.detect_pose() 一致（17 点，z/visibility 补齐）。
     """
     landmarks = []
     for pid in range(17):  # COCO 17 点（RTMPose）
         if pid in pts:
             x, y = pts[pid]
-            landmarks.append((x, y, 0.0, 1.0))
+            landmarks.append((x, y, 0.0, vis))
         else:
             landmarks.append((0.0, 0.0, 0.0, 0.0))
     return {"landmarks": landmarks, "image_size": (640, 480)}
@@ -795,7 +1003,86 @@ def selftest_posture() -> None:
     print("  selftest_posture: OK")
 
 
+def selftest_ergonomic() -> None:
+    """合成数据自测 ErgonomicRiskFeatures：CVA 竖直=90° / 前伸=45°；FSA 下垂=90° /
+    前伸~26.6°；单耳/单肩可见侧仍可算；遮挡低置信→维持上一有效值、不崩溃、不出 0。"""
+    # 小窗口参数：自测用显式时间戳，几帧内就能攒够窗口
+    small = dict(window_seconds=5.0, min_frames=2, min_window_seconds=0.1)
+
+    # 1) 竖直（耳在肩正上方）+ 上臂下垂 → CVA 90° / FSA 90°
+    upright = {3: (0.5, 0.05), 4: (0.5, 0.05),   # 双耳同点，中点 = (0.5,0.05)
+               5: (0.4, 0.35), 6: (0.6, 0.35),   # 肩中点 = (0.5,0.35)
+               7: (0.4, 0.6), 8: (0.6, 0.6)}     # 肘中点 = (0.5,0.6)，上臂竖直
+    fe = ErgonomicRiskFeatures(**small)
+    for i in range(5):
+        fe.update(_make_pose(upright), timestamp=float(i) * 0.1)
+    r = fe.update(_make_pose(upright), timestamp=0.5)
+    assert r['cva_valid'] and r['fsa_valid'], "竖直帧 CVA/FSA 都应可算"
+    _assert_close(r['cva_deg'], 90.0, 1e-6, "竖直 CVA 应为 90°")
+    _assert_close(r['fsa_deg'], 90.0, 1e-6, "上臂下垂 FSA 应为 90°")
+
+    # 2) 头前伸（耳前移 45° 斜）+ 上臂前伸 → CVA 45° / FSA ~26.6°
+    lean = {3: (0.65, 0.20), 4: (0.65, 0.20),    # 耳中点 (0.65,0.20)
+            5: (0.5, 0.35), 6: (0.5, 0.35),      # 肩中点 (0.5,0.35) → dx=0.15,dy=-0.15
+            7: (0.7, 0.45), 8: (0.7, 0.45)}      # 肘中点 (0.7,0.45) → dx=0.2,dy=0.1
+    fe = ErgonomicRiskFeatures(**small)
+    for i in range(5):
+        fe.update(_make_pose(lean), timestamp=float(i) * 0.1)
+    r = fe.update(_make_pose(lean), timestamp=0.5)
+    _assert_close(r['cva_deg'], 45.0, 0.5, "前伸 CVA 应为 45°")
+    _assert_close(r['fsa_deg'], math.degrees(math.atan(0.1 / 0.2)), 0.5,
+                  "上臂前伸 FSA 应为 ~26.6°")
+
+    # 3) 单侧可见：只有右耳(4) 或 只有左肩(5) → 取可见侧，仍能算（竖直 → 90°）
+    for pts in ({4: (0.5, 0.05), 5: (0.4, 0.35), 6: (0.6, 0.35),
+                 7: (0.4, 0.6), 8: (0.6, 0.6)},
+                {3: (0.5, 0.05), 4: (0.5, 0.05), 5: (0.5, 0.35),
+                 7: (0.5, 0.6), 8: (0.5, 0.6)}):
+        fe = ErgonomicRiskFeatures(**small)
+        for i in range(3):
+            fe.update(_make_pose(pts), timestamp=float(i) * 0.1)
+        r = fe.update(_make_pose(pts), timestamp=0.3)
+        assert r['cva_deg'] is not None, "单耳/单肩可见侧 CVA 应可算"
+        _assert_close(r['cva_deg'], 90.0, 1e-6, "单侧可见竖直 CVA 应为 90°")
+
+    # 4) 降级：遮挡/低置信帧（所有关键点 vis=0.1 < 0.3）→ 维持上一有效值、
+    #    valid=False；不崩溃、不出 0
+    fe = ErgonomicRiskFeatures(**small)
+    for i in range(5):
+        fe.update(_make_pose(upright), timestamp=float(i) * 0.1)
+    ok = fe.update(_make_pose(upright), timestamp=0.5)
+    held = fe.update(_make_pose(upright, vis=0.1), timestamp=0.6)
+    assert held['cva_deg'] == ok['cva_deg'], "低置信帧应维持上一有效 CVA"
+    assert not held['cva_valid'], "低置信帧 cva_valid 应为 False"
+    assert held['fsa_deg'] == ok['fsa_deg'], "低置信帧应维持上一有效 FSA"
+    assert not held['fsa_valid'], "低置信帧 fsa_valid 应为 False"
+
+    # 5) 从未有有效数据（无人 / 只剩髋）→ None + valid=False，不崩溃
+    fe = ErgonomicRiskFeatures(**small)
+    r = fe.update(None, timestamp=0.0)
+    assert r['cva_deg'] is None and r['fsa_deg'] is None, "无人帧应为 None"
+    assert not r['cva_valid'] and not r['fsa_valid'], "无人帧 valid 应为 False"
+    r2 = fe.update(_make_pose({11: (0.5, 0.8), 12: (0.5, 0.8)}), timestamp=0.1)
+    assert r2['cva_deg'] is None and r2['fsa_deg'] is None, \
+        "耳/肩/肘都缺（只剩髋）时 CVA/FSA 应为 None"
+
+    # 6) FSA 趋势：上臂从下垂逐渐前伸 → fsa_trend_deg < 0（负 = 更接近水平 = 更前伸）
+    down = {5: (0.5, 0.35), 6: (0.5, 0.35), 7: (0.5, 0.6), 8: (0.5, 0.6)}
+    fwd = {5: (0.5, 0.35), 6: (0.5, 0.35), 7: (0.7, 0.45), 8: (0.7, 0.45)}
+    fe = ErgonomicRiskFeatures(**small)
+    for i in range(4):
+        fe.update(_make_pose(down), timestamp=float(i) * 0.1)
+    for i in range(4):
+        fe.update(_make_pose(fwd), timestamp=0.4 + float(i) * 0.1)
+    r = fe.update(_make_pose(fwd), timestamp=0.8)
+    assert r['fsa_trend_deg'] is not None and r['fsa_trend_deg'] < 0, \
+        f"上臂前伸 FSA 趋势应为负，实际 {r['fsa_trend_deg']}"
+
+    print("  selftest_ergonomic: OK")
+
+
 if __name__ == "__main__":
     selftest_movement()
     selftest_posture()
+    selftest_ergonomic()
     print("features selftest: ALL PASSED")

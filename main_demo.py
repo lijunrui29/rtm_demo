@@ -9,6 +9,7 @@
     python main_demo.py --perf-log                         # 性能采集：每 30 帧写一行 CPU/RSS/推理耗时到 CSV
     python main_demo.py --dump-schema                      # 每帧导出人体侧规范 schema JSON（对接机器人用）
     python main_demo.py --no-show-schema                   # 不叠加 27 关节读数面板（默认叠加，测试用）
+    python main_demo.py --cva-severe-threshold 40          # 标定 CVA 分级阈值（默认 55/50/44）
     python main_demo.py --selftest                          # 合成数据自测（不碰摄像头/mediapipe）
 
 ESC 退出。首帧较慢（惰性初始化 pose 检测器），正常。
@@ -30,11 +31,13 @@ from capture import CameraCapture                 # noqa: E402
 from pose_estimation import detect_pose           # noqa: E402
 from features import (FeatureExtractor,           # noqa: E402
                       PostureFeatures,
-                      selftest_movement, selftest_posture)
+                      ErgonomicRiskFeatures,
+                      selftest_movement, selftest_posture, selftest_ergonomic)
 from decision import (StillnessDecision,          # noqa: E402
                       SedentaryAlert, selftest_sedentary,
                       PostureDecision, PostureAlert,
-                      selftest_posture_decision, selftest_posture_alert)
+                      selftest_posture_decision, selftest_posture_alert,
+                      CvaRisk, selftest_cva_risk)
 from output import FrameRenderer, export_pose_json  # noqa: E402
 from perf_logger import PerfLogger                # noqa: E402
 from pose_schema import human_adapter, selftest_schema  # noqa: E402
@@ -83,6 +86,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-show-schema", dest="show_schema", action="store_false",
                    help="不在画面上叠加 27 个规范关节读数面板（servo/名称/位置/角度/状态）")
     p.set_defaults(show_schema=True)
+    p.add_argument("--cva-normal-threshold", type=float, default=55.0,
+                   help="CVA 正常阈值（度，>= 此值判正常）。默认 55，参考 Mostafaee "
+                        "2022 观察性分组，非临床诊断标准；本系统用肩点近似 C7，"
+                        "按实拍标定")
+    p.add_argument("--cva-mild-threshold", type=float, default=50.0,
+                   help="CVA 轻度阈值（度，>= 此值判轻度头前伸），默认 50")
+    p.add_argument("--cva-severe-threshold", type=float, default=44.0,
+                   help="CVA 中重度阈值（度，>= 此值判中重度、更低判重度），默认 44")
     p.add_argument("--selftest", action="store_true",
                    help="用合成数据自测各层，不打开摄像头")
     return p
@@ -98,6 +109,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     feats = FeatureExtractor(window_seconds=args.window_seconds)
     post = PostureFeatures()
+    ergo = ErgonomicRiskFeatures()   # CVA/FSA 姿态风险指标
     dec = StillnessDecision(still_threshold=args.still_threshold,
                             moving_threshold=args.moving_threshold)
     alert = SedentaryAlert(duration_limit_sec=args.duration_limit)
@@ -106,6 +118,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
                            back_threshold=args.back_threshold,
                            neck_threshold=args.neck_threshold)
     palert = PostureAlert(duration_limit_sec=args.posture_duration_limit)
+    cva_risk = CvaRisk(normal_threshold=args.cva_normal_threshold,
+                       mild_threshold=args.cva_mild_threshold,
+                       severe_threshold=args.cva_severe_threshold)
     ren = FrameRenderer(still_threshold=args.still_threshold,
                         moving_threshold=args.moving_threshold,
                         debug=args.debug,
@@ -147,6 +162,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 state = dec.update(movement)
                 posture = post.update(pose)
                 posture_state = pdec.update(posture)
+                # CVA/FSA 姿态风险指标：features 只算平滑值，decision 只读 CVA 分级
+                # （FSA 是辅助指标，不参与任何判断，仅 output 附注显示）
+                erg = ergo.update(pose, ts)
+                cva_level = cva_risk.update(erg['cva_deg'])
                 # 临时标定：--debug 下每 30 帧（约 1s）打印一次坐姿特征（标定完删除）
                 dbg_cnt += 1
                 if args.debug and dbg_cnt % 30 == 0:
@@ -170,6 +189,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
                          slump_elapsed_sec=palert.elapsed_sec)
                 if args.show_schema and schema is not None:
                     ren.draw_schema(frame, schema)
+                ren.draw_cva_overlay(frame, erg, cva_level)
                 ren.log(state, movement, posture_state)
 
                 cv2.imshow("Stillness Demo (RTMPose)", frame)
@@ -194,6 +214,10 @@ def selftest() -> None:
     selftest_posture_decision()
     print("===== 5. decision: posture alert =====")
     selftest_posture_alert()
+    print("===== 5b. features: CVA/FSA ergonomic risk =====")
+    selftest_ergonomic()
+    print("===== 5c. decision: CVA grading =====")
+    selftest_cva_risk()
     print("===== 6. pose_schema: human/robot adapter + JSON export =====")
     selftest_schema()
     print("\nALL SELFTESTS PASSED.")
