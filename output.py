@@ -4,6 +4,8 @@ output 层：把 decision 的状态和 features 的移动量"呈现"给用户。
 两个出口：
     draw(frame, state, movement)  在画面上绘制（英文标签 + 移动量 + 可选的走势图）
     log(state, movement)          控制台英文日志（限频，默认 0.5 秒一条）
+    export_pose_json(schema, path) 把规范 schema（pose_schema 输出）导出为 JSON，
+                                供对接机器人/肉眼对比两边关节命名
 
 为什么全部用英文：
     cv2.putText 自带 Hershey 字体不支持中文，画出来是方块；
@@ -35,12 +37,15 @@ debug 模式：
             画一行 `Still 12.3/20s  Slump 7.8/10s` 计时（阈值来自构造参数
             duration_limit_sec / posture_duration_limit_sec），方便测试时看进度。
     pose:    pose_estimation.detect_pose() 的返回值 {'landmarks': [(x,y,z,vis)x17], 'image_size'}。
-            画成骨架叠加层（关键点 + 连接线），默认开启，可用 draw_skeleton=False 关闭。
-            骨架只画躯干 + 四肢关键点（COCO 的 5-16，绿色），**不画头部/面部点
-            （0-4）及其连线**——脸只用于角度计算，画面骨架不含脸。
-            例外：耳朵点（3/4）单独用黄色画出，因为它不参与骨架连线、也不属于
-            躯干四肢，单独标出来方便确认坐姿角度里"耳-肩-髋"链路的耳端有没有
-            被检测到（head_neck_angle / back_curvature 都要用到耳）。
+            画成骨架叠加层（关键点 + 连接线 + pid/置信度标签），默认开启，
+            可用 draw_skeleton=False 关闭。
+            画 3-16 号点：躯干/四肢 5-16 绿、耳 3/4 黄（坐姿角度链路用）；
+            面部 0-2（鼻/眼）不画——机器人控制台（figurobot-console）没有
+            面部关节，画了没对照。置信度 <0.3 的"没检测到"点画灰色空心圈
+            示意位置。每个点旁标 `pid:置信度`，字色按置信度分档（与
+            pose_schema status 一致）：>=0.5 绿、0.3~0.5 黄（低置信度）、
+            <0.3 灰（没检测到）。连线只有躯干 + 四肢（头/脸不连线），且
+            两端都 >=0.3 才画，避免噪点乱连。
     角度说明: 画面左下角固定绘制"耳-肩-髋三点连线角度定义"英文说明，
             文字来自 features.ANGLE_LEGEND（单一来源，output 只渲染），
             不随帧变化、无需参数。
@@ -53,6 +58,7 @@ debug 模式：
 
 from __future__ import annotations
 
+import json
 import time
 from collections import deque
 from typing import Deque, Optional
@@ -101,6 +107,15 @@ _COLOR_POSTURE_UNKNOWN = (180, 180, 180)
 
 # 走势图面板尺寸
 _CHART_W, _CHART_H = 320, 48
+
+# 规范关节状态颜色（draw_schema 面板用，BGR）
+_STATUS_COLOR = {
+    "ok": (60, 200, 60),        # 绿
+    "low_conf": (0, 210, 255),  # 黄
+    "na": (150, 150, 150),      # 灰
+    "offline": (0, 80, 220),    # 红
+    "error": (0, 60, 220),      # 红
+}
 
 
 class FrameRenderer:
@@ -264,10 +279,16 @@ class FrameRenderer:
     # ---------- 骨架叠加 ----------
 
     def _draw_skeleton(self, frame: np.ndarray, pose: dict) -> None:
-        """把姿态识别的骨架（关键点 + 连接线）叠到画面上。
+        """把姿态识别的骨架（关键点 + 连接线 + pid/置信度标签）叠到画面上。
 
         pose: {'landmarks': [(x,y,z,vis) x17], 'image_size': (w,h)}
-        只画 visibility >= 0.3 的点/线，低可见度的残缺点不画，避免噪点乱连。
+        画 3-16 号点（测试时能看到编号+置信度）；面部点 0-2（鼻/眼）不画——
+        机器人控制台（figurobot-console SKELETON）没有面部关节，画了没对照。
+            点颜色按部位——躯干/四肢 5-16 绿、耳 3/4 黄（坐姿角度链路用）；
+            置信度 <0.3 的"没检测到"点画灰色空心小圈示意位置。
+            标签字色按置信度分档（与 pose_schema status 一致）：
+                >=0.5 绿、0.3~0.5 黄（低置信度）、<0.3 灰（没检测到）。
+        连线仍只连躯干/四肢，且两端都可见(>=0.3)才画，避免噪点乱连。
         """
         landmarks = pose.get('landmarks')
         image_size = pose.get('image_size')
@@ -275,32 +296,60 @@ class FrameRenderer:
             return
 
         w, h = image_size
-        visibility_min = 0.3
+        # 与 features.visibility_min / pose_schema 的置信度分档保持一致
+        VIS_LOW = 0.3    # < 此值 = 没检测到（灰）
+        VIS_OK = 0.5     # >= 此值 = 置信度足够（绿）
 
         def px(pid: int) -> Optional[tuple]:
-            """关键点归一化坐标 -> 像素坐标；可见度不足返回 None。"""
+            """关键点归一化坐标 -> 像素坐标（不过滤可见度，分级用颜色表达）。"""
             if pid >= len(landmarks):
                 return None
-            x, y, _z, vis = landmarks[pid]
-            if vis < visibility_min:
-                return None
+            x, y, _z, _vis = landmarks[pid]
             return int(x * w), int(y * h)
 
-        # 关键点：只画躯干 + 四肢（COCO 的 5-16，绿色）；头部/面部 0-4 不画
-        for pid in range(5, 17):
-            p = px(pid)
-            if p is not None:
-                cv2.circle(frame, p, 4, (0, 255, 0), -1, cv2.LINE_AA)
+        def vis_of(pid: int) -> float:
+            return landmarks[pid][3] if pid < len(landmarks) else 0.0
 
-        # 耳朵点（3/4）：单独用黄色画出。它们不参与骨架连线，但坐姿角度
-        # （head_neck_angle / back_curvature）依赖耳点，标出来方便确认检测。
-        for pid in (3, 4):
+        # 关键点：画 3-16 号（连线见下）。面部 0-2（鼻/眼）不画——机器人控制台
+        # 没有面部关节（figurobot-console SKELETON 头部只有 头Y/颈P），画了没对照。
+        # 躯干/四肢 5-16 绿；耳 3/4 黄（head_neck_angle / back_curvature 依赖
+        # 耳点，单独标出）。
+        # 没检测到(<0.3)的点画灰色空心小圈——示意模型认为的位置，方便定位丢点。
+        for pid in range(3, 17):
             p = px(pid)
-            if p is not None:
-                cv2.circle(frame, p, 4, (0, 215, 255), -1, cv2.LINE_AA)
+            if p is None:
+                continue
+            if vis_of(pid) < VIS_LOW:
+                cv2.circle(frame, p, 3, (150, 150, 150), 1, cv2.LINE_AA)
+            elif pid <= 4:
+                cv2.circle(frame, p, 4, (0, 215, 255), -1, cv2.LINE_AA)  # 黄：耳
+            else:
+                cv2.circle(frame, p, 4, (0, 255, 0), -1, cv2.LINE_AA)    # 绿：躯干/四肢
+
+        # 标签：每个画出的点（3-16）右下角标 `pid:置信度`，字色按置信度分档（黑描边保证可读）。
+        for pid in range(3, 17):
+            p = px(pid)
+            if p is None:
+                continue
+            vis = vis_of(pid)
+            if vis >= VIS_OK:
+                color = (60, 200, 60)      # 绿：置信度够
+            elif vis >= VIS_LOW:
+                color = (0, 215, 255)      # 黄：低置信度
+            else:
+                color = (150, 150, 150)    # 灰：没检测到
+            label = f"{pid}:{vis:.2f}"
+            tx = min(p[0] + 6, w - 42)     # 不超出画面右缘（约 40px 宽的标签）
+            ty = p[1] + 12
+            cv2.putText(frame, label, (tx, ty + 1),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, label, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
         # 连接线（两端都可见才画，防止线条插到残缺点）
         for a, b in POSE_CONNECTIONS:
+            if vis_of(a) < VIS_LOW or vis_of(b) < VIS_LOW:
+                continue
             pa, pb = px(a), px(b)
             if pa is not None and pb is not None:
                 cv2.line(frame, pa, pb, (255, 0, 0), 2, cv2.LINE_AA)
@@ -404,6 +453,74 @@ class FrameRenderer:
             cv2.putText(frame, line, (x0 + pad_x, y),
                         cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
+    # ---------- 27 关节读数面板（默认显示，--no-show-schema 关闭） ----------
+
+    def draw_schema(self, frame: np.ndarray, schema: Optional[dict] = None) -> None:
+        """画面右下角叠加 27 个规范关节的读数面板（测试用）。
+
+        schema: pose_schema.human_adapter / robot_adapter 的输出 dict。
+                右侧竖向列出 27 个 DOF 的 servo_id / 规范名 / 位置 / 角度 / 状态：
+                    position 为归一化坐标 (x,y)（关键点数据），na 显示 --；
+                    角度 na 显示 --；状态颜色 ok=绿 low_conf=黄 na=灰 offline/error=红。
+        Hershey 字体不支持中文，这里用英文规范名；zh_name 在 JSON 导出里带。
+        本层只渲染传入的 dict，不 import pose_schema（保持分层）。
+        """
+        if not schema:
+            return
+        joints = schema.get("joints")
+        if not joints:
+            return
+        items = list(joints.values())
+        h, w = frame.shape[:2]
+
+        header = "Schema (27 DOF)  sv/name/pos/angle/status"
+        scale = 0.40
+        pad_x, pad_y = 8, 6
+
+        def _row(j: dict) -> str:
+            a = j.get("angle_deg")
+            ang = "--" if a is None else f"{a:.1f}"
+            pos = j.get("position")
+            if pos is None or pos.get("x") is None or pos.get("y") is None:
+                pos_s = "--"
+            else:
+                pos_s = f"({pos['x']:.3f},{pos['y']:.3f})"
+            return (f"{j['servo_id']:>2} {j['canonical']:<18} "
+                    f"{pos_s:>16} {ang:>7} {j.get('status', 'na')}")
+
+        rows = [_row(j) for j in items]
+
+        text_w = 0
+        for line in [header] + rows:
+            (tw, _th), _base = cv2.getTextSize(
+                line, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+            text_w = max(text_w, tw)
+
+        n = len(rows) + 1  # 标题 + 27 行
+        line_h = 15
+        # 面板装不下（小画面）时压缩行高
+        line_h = min(line_h, max(10, (h - 2 * pad_y - 16) // n))
+
+        x0 = max(w - text_w - 2 * pad_x - 8, 0)
+        y1 = h - 8
+        y0 = y1 - n * line_h - 2 * pad_y
+
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x0, y0), (x0 + text_w + 2 * pad_x, y1),
+                      (25, 25, 35), -1)
+        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+        cv2.rectangle(frame, (x0, y0), (x0 + text_w + 2 * pad_x, y1),
+                      (110, 110, 130), 1)
+
+        cv2.putText(frame, header, (x0 + pad_x, y0 + pad_y + line_h - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, (230, 230, 230), 1,
+                    cv2.LINE_AA)
+        for i, j in enumerate(items):
+            y = y0 + pad_y + line_h * (i + 2) - 4
+            color = _STATUS_COLOR.get(j.get("status"), (150, 150, 150))
+            cv2.putText(frame, rows[i], (x0 + pad_x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
+
     # ---------- 提醒横幅（英文） ----------
 
     def _draw_banner(self, frame: np.ndarray, text: str,
@@ -450,3 +567,18 @@ class FrameRenderer:
                      (int(x1 + dx * e), int(y1 + dy * e)),
                      color, 1)
             i += dash + gap
+
+
+# ---------- 骨架数据导出（规范 schema → JSON） ----------
+
+def export_pose_json(schema: dict, path: Optional[str] = None) -> str:
+    """把规范 schema（pose_schema.human_adapter / robot_adapter 的输出）导出为 JSON。
+
+    用对齐后的规范命名（shoulder_left_pitch 等），方便未来直接对接机器人侧 /
+    肉眼对比两边数据。path 非 None 时同时写盘（UTF-8）。返回 JSON 字符串。
+    """
+    text = json.dumps(schema, ensure_ascii=False, indent=2)
+    if path is not None:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    return text

@@ -7,6 +7,8 @@
     python main_demo.py --camera 0 --duration-limit 1200 --posture-duration-limit 300  # 生产阈值
     python main_demo.py --no-skeleton                      # 不画骨架（只想看数字/省 CPU）
     python main_demo.py --perf-log                         # 性能采集：每 30 帧写一行 CPU/RSS/推理耗时到 CSV
+    python main_demo.py --dump-schema                      # 每帧导出人体侧规范 schema JSON（对接机器人用）
+    python main_demo.py --no-show-schema                   # 不叠加 27 关节读数面板（默认叠加，测试用）
     python main_demo.py --selftest                          # 合成数据自测（不碰摄像头/mediapipe）
 
 ESC 退出。首帧较慢（惰性初始化 pose 检测器），正常。
@@ -33,8 +35,9 @@ from decision import (StillnessDecision,          # noqa: E402
                       SedentaryAlert, selftest_sedentary,
                       PostureDecision, PostureAlert,
                       selftest_posture_decision, selftest_posture_alert)
-from output import FrameRenderer                  # noqa: E402
+from output import FrameRenderer, export_pose_json  # noqa: E402
 from perf_logger import PerfLogger                # noqa: E402
+from pose_schema import human_adapter, selftest_schema  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,12 +69,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reminder-hold", type=float, default=8.0,
                    help="提醒横幅在画面上停留秒数，默认 8")
     p.add_argument("--no-skeleton", dest="draw_skeleton", action="store_false",
-                   help="不把姿态骨架（关键点+连线）叠到画面上")
+                   help="不把姿态骨架（关键点+连线+pid/置信度标签）叠到画面上")
     p.set_defaults(draw_skeleton=True)
     p.add_argument("--perf-log", nargs="?", const="performance_log.csv",
                    default=None, metavar="PATH",
                    help="性能采集：每 30 帧写一行 进程CPU/RSS/相对时间戳/该帧推理耗时"
                         " 到 CSV（默认 performance_log.csv，可指定路径；需已装 psutil）")
+    p.add_argument("--dump-schema", nargs="?", const="pose_schema_dump.json",
+                   default=None, metavar="PATH",
+                   help="每帧把人体侧规范 schema（pose_schema.human_adapter 输出）"
+                        " 导出为 JSON（默认 pose_schema_dump.json，可指定路径），"
+                        " 供对接机器人/肉眼对比两边关节命名")
+    p.add_argument("--no-show-schema", dest="show_schema", action="store_false",
+                   help="不在画面上叠加 27 个规范关节读数面板（servo/名称/位置/角度/状态）")
+    p.set_defaults(show_schema=True)
     p.add_argument("--selftest", action="store_true",
                    help="用合成数据自测各层，不打开摄像头")
     return p
@@ -123,6 +134,15 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     perf.sample(frame_idx, pose_ms=pose_ms)
                 frame_idx += 1
 
+                # 对接机器人测试：--dump-schema 导出 JSON / 画面默认叠加 27 关节读数面板
+                # （--no-show-schema 关闭）。
+                # human_adapter 是纯数学转换（27 个 DOF 循环），每帧一次足够。
+                schema = None
+                if args.dump_schema or args.show_schema:
+                    schema = human_adapter(pose)
+                    if args.dump_schema:
+                        export_pose_json(schema, args.dump_schema)
+
                 movement = feats.update(pose, ts)
                 state = dec.update(movement)
                 posture = post.update(pose)
@@ -148,6 +168,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
                          posture_state, posture_reminder,
                          still_elapsed_sec=alert.elapsed_sec,
                          slump_elapsed_sec=palert.elapsed_sec)
+                if args.show_schema and schema is not None:
+                    ren.draw_schema(frame, schema)
                 ren.log(state, movement, posture_state)
 
                 cv2.imshow("Stillness Demo (RTMPose)", frame)
@@ -172,6 +194,8 @@ def selftest() -> None:
     selftest_posture_decision()
     print("===== 5. decision: posture alert =====")
     selftest_posture_alert()
+    print("===== 6. pose_schema: human/robot adapter + JSON export =====")
+    selftest_schema()
     print("\nALL SELFTESTS PASSED.")
 
 
