@@ -52,6 +52,26 @@ RMS：偶发的一帧检测抖动/孤点不会把移动量顶上去，只有持�
                 越小越前伸）平滑值 + FSA（前伸肩角：上臂 vs 水平线）平滑值与趋势；
                 关键点不足/低置信时维持上一有效值（*_valid=False），不报错、不出 0
                 （C7 用肩点近似，详见类内 docstring）
+
+    CvaProxyFeatures(window_seconds=3.0, min_frames=5, min_window_seconds=1.0,
+                     visibility_min=0.3, smooth_tau_sec=1.0)
+    update(pose_result, timestamp=None) -> dict  CVA-like proxy（工程化代理，**非临床
+                CVA**）：同一个"耳-肩连线 vs 水平线"的角度，但在**像素空间**算
+                （归一化坐标会带上画面 w/h 的纵横比偏差），EMA 平滑值 + 本帧 raw
+                值 + 参与点平均置信度 + 供绘制用的几何。FHP 判据用这一枚
+                （见 decision.FhpDecision），ErgonomicRiskFeatures.cva_deg 那条线
+                保持原语义不变（详见类内 docstring）
+
+    EarShoulderProxyFeatures(window_seconds=3.0, min_frames=5,
+                             min_window_seconds=1.0, visibility_min=0.3,
+                             smooth_tau_sec=1.0,
+                             min_shoulder_width_norm=0.25)
+    update(pose_result, timestamp=None) -> dict  **Ear–Shoulder displacement proxy**
+                （实验特征，正面机位用）：耳中点与肩中点的**水平像素位移**除以
+                肩宽（像素），EMA 平滑值 + 本帧 raw 值 + 肩宽/中点 x/四个单点
+                置信度（供逐帧 CSV 审计）。**只是图像平面里的相对水平位移，不是
+                真实的 3D 前伸距离，绝不能叫 Forward Head Distance / clinical FHD**；
+                **尚未接入任何 decision**（只被正面实验脚本消费，见类内 docstring）
 """
 
 from __future__ import annotations
@@ -94,6 +114,14 @@ ANKLE_IDS = (15, 16)
 # 不进窗口、侧身一久窗口排空 → 持续 NO PERSON；而侧身移动量只是偏高（0.045~0.143，
 # 非爆炸），靠调高 still-threshold 兜底更合适 —— 该门控 2026-08-19 已移除（见 CLAUDE.md）。
 NECK_COMPRESSION_MAX = 1.5       # 颈压缩比值超此物理上限 → 视角退化，作废（= N/A）
+
+# Ear–Shoulder displacement proxy 的肩宽退化门控（2026-09-23，实验特征用）：
+# 该 proxy 的分母就是肩宽（两肩像素距离），侧身时肩宽被投影压扁（正对归一化
+# 肩宽 ~0.56、侧身 0.01~0.21，见 CLAUDE.md 侧身处理），比值会被放大成无意义的大数。
+# 归一化肩宽低于此值的帧判"视角退化"：不出有效读数（valid=False），但 raw 与
+# 肩宽仍记进 CSV 供审计 —— 与 NECK_COMPRESSION_MAX 的"视角退化时宁可不判（N/A），
+# 不乱判"同一口径。阈值落在观测到的 0.56（正对）/ 0.21（侧身）之间。
+MIN_SHOULDER_WIDTH_NORM = 0.25
 
 # 一个点的二维坐标
 Point = Tuple[float, float]
@@ -821,6 +849,499 @@ class ErgonomicRiskFeatures(_WindowedMedianExtractor):
 
 
 # ---------------------------------------------------------------------------
+# CvaProxyFeatures：CVA-like proxy（像素空间）—— FHP 判据用的那一枚
+# （2026-09-23 新增，纯 stdlib；**工程化代理指标，不是临床 CVA**）
+# ---------------------------------------------------------------------------
+
+class CvaProxyFeatures(ErgonomicRiskFeatures):
+    """CVA-like proxy：耳-肩连线与水平线的夹角（度，像素空间），越小 = 头越前伸。
+
+    === 是什么 / 不是什么（重要）===
+    这是**工程化代理指标（proxy）**，不是临床 CVA：
+        * 标准 CVA 在矢状面（纯侧面）由 C7 与耳屏（tragus）连线量；
+        * 本系统是单 RGB 摄像头、机位在正前方到约 45° 前侧之间，C7 不可见
+          —— C7 用双肩中点近似（真实 C7 在肩点后方且更靠上，方向偏差稳定、
+          量值偏移，所以文献阈值不能直接套，见 decision.CVA_PROXY_VIEW_PRESETS）；
+        * 头参考是 RTMPose 的"耳"点（3/4），不是耳屏。
+    所以本指标**不等于临床 CVA**，数值**不能与文献 CVA 阈值（如 50°）比较**，
+    阈值一律按本系统自己的机位自标定。
+    同理：本文件里任何"耳-肩水平位移"类的量只能叫 Ear-Shoulder displacement
+    proxy —— 单目图像里的 x/y 位移不等于真实的 3D 前伸距离，别叫 Forward Head
+    Distance（见 CLAUDE.md / 本类注释）。
+
+    === 数学定义（单帧，像素空间）===
+        C7 代理 = 可见肩点(5/6)的中点（两肩都可见取中点，单肩取可见侧）
+        头参考  = 可见耳点(3/4)的中点（同上）
+        参与点先过置信度门控 visibility >= visibility_min（默认 0.3）
+        cva_proxy = atan2(|Δy_px|, |Δx_px|)，单位度，范围 0~90
+                    （耳在肩正上方 = 90°，头前伸越大越接近 0）
+
+    === 为什么必须在像素空间算（不能直接用 features 里现成的 cva_deg）===
+    归一化坐标是"先被画面宽高除过"的，角度会带上纵横比偏差：
+        tan θ_像素 = (H/W) · tan θ_归一化
+    2026-09-23 实测（front.csv / f45.csv，1280x720 取景）：两者 tan 之比的中位数
+    稳定等于 0.5625 = H/W，即 16:9 取景下归一化角系统性偏大；45° 机位同一批帧的
+    中位数差到约 10°（归一化 75.5° vs 像素 65.1°）。FHP 判据的阈值是在**像素
+    空间**标定的（= 录制 CSV 里的 cva_proxy 列），所以判据必须用本类。
+    ErgonomicRiskFeatures.cva_deg 保持原语义不动（那条线是"文献化 CVA 展示"，
+    阈值待标定，见 CLAUDE.md 开放问题）。
+
+    继承 ErgonomicRiskFeatures 只为复用取点/几何原语（_extract_valid / _avg /
+    _angle_from_horizontal），语义上不是父类的特例 —— 与本模块
+    _WindowedMedianExtractor"共享原语"的做法一致。
+
+    === 时间平滑：一阶 EMA（指数滑动平均）===
+        alpha = 1 - exp(-dt / smooth_tau_sec)，与帧率无关；
+        只在能算出 raw 的帧上推进（丢帧期间不推进 → 恢复后按累积 dt 重新贴合，
+        不会把断开前后的两段平均到一起）。
+        raw 值同时保留在 cva_proxy_raw_deg（debug / 离线分析用）：判据消费平滑值，
+        raw 只报不用。
+        预热：沿用父类语义，凑够 min_frames 帧且跨度 >= min_window_seconds 前
+        不出平滑值（刚开摄像头不报警），raw 从第一帧就有。
+
+    === 降级（关键点缺失 / 低置信 / 取不到 image_size）===
+    本帧不算 → cva_proxy_raw_deg=None、cva_proxy_valid=False；平滑值与
+    conf/pts/geom 都**维持上一有效值**（从未有效则 None），不报错、不出 0。
+    取不到 image_size（构造不出的 pose dict）也算降级：像素空间角度算不了，
+    宁可不判也不出一个带纵横比偏差的数。
+
+    接口约定（保持稳定，别改签名）：
+        CvaProxyFeatures(window_seconds=3.0, min_frames=5,
+                         min_window_seconds=1.0, visibility_min=0.3,
+                         smooth_tau_sec=1.0)
+        update(pose_result, timestamp=None) -> dict
+            {'cva_proxy_deg':       float | None   EMA 平滑值（判据用这个）
+             'cva_proxy_raw_deg':   float | None   本帧原始值（debug 用，无效帧为 None）
+             'cva_proxy_valid':     bool           本帧是否真的算出了读数
+                                                   （False = 预热中/降级/维持旧值）
+             'cva_proxy_conf':      float | None   本帧参与点的平均置信度 0~1
+             'cva_proxy_pts':       str | None     本帧用了哪些点，如 "ear_mid+sh_mid"
+             'cva_proxy_geom':      dict | None    {'head': (x_px, y_px),
+                                                   'c7': (x_px, y_px)}
+                                                   供 output 层画辅助线用
+                                                   （output 不重算几何）}
+        reset()
+    """
+
+    def __init__(self,
+                 window_seconds: float = 3.0,
+                 min_frames: int = 5,
+                 min_window_seconds: float = 1.0,
+                 visibility_min: float = 0.3,
+                 smooth_tau_sec: float = 1.0) -> None:
+        """
+        参数:
+            window_seconds / min_frames / min_window_seconds: 只用于"预热"语义
+                （凑够帧数 + 时间跨度前不出平滑值），与父类同约定。
+            visibility_min: 某关键点的 visibility 低于此值视为无效点（置信度过滤）。
+            smooth_tau_sec: EMA 时间常数（秒），越小越跟手、越大越稳。默认 1.0
+                （30fps 下 alpha ≈ 0.033，约 1 秒内跟上真实变化）。
+        """
+        super().__init__(window_seconds=window_seconds, min_frames=min_frames,
+                         min_window_seconds=min_window_seconds,
+                         visibility_min=visibility_min)
+        if smooth_tau_sec <= 0:
+            raise ValueError("smooth_tau_sec 必须 > 0")
+        self.smooth_tau_sec = smooth_tau_sec
+
+        self._ema: Optional[float] = None       # 平滑值（只在有效帧上推进）
+        self._last_ts: Optional[float] = None   # 上一有效帧时间戳（EMA 的 dt 基准）
+        self._warm_start: Optional[float] = None  # 预热窗口起点
+        self._warm_n = 0                        # 预热窗口内的有效帧数
+        self._last = {                          # 上一有效读数（降级时维持）
+            'deg': None, 'conf': None, 'pts': None, 'geom': None,
+        }
+
+    def reset(self) -> None:
+        """清空平滑状态与上一有效值，重新开始。"""
+        super().reset()
+        self._ema = None
+        self._last_ts = None
+        self._warm_start = None
+        self._warm_n = 0
+        self._last = {'deg': None, 'conf': None, 'pts': None, 'geom': None}
+
+    def update(self,
+               pose_result: Optional[dict],
+               timestamp: Optional[float] = None) -> dict:
+        """喂入一帧 pose 结果，返回 CVA-like proxy 特征（见类 docstring 的返回结构）。
+
+        参数:
+            pose_result: pose_estimation.detect_pose() 的返回值
+                         {'landmarks': [(x, y, z, visibility) x17],
+                          'image_size': (w, h)}；未检测到人体时为 None。
+                         image_size 缺失时本帧降级（像素空间角度算不了）。
+            timestamp:   该帧的单调时间戳（秒），默认 time.monotonic()；
+                         视频回放/自测请传入模拟时间戳（与其它特征同约定）——
+                         EMA 的 dt 与预热都按它算。
+        """
+        now = timestamp if timestamp is not None else time.monotonic()
+
+        raw = conf = pts = geom = None
+        if pose_result is not None:
+            landmarks = pose_result.get('landmarks')
+            size = pose_result.get('image_size')
+            if landmarks and size and size[0] > 0 and size[1] > 0:
+                w, h = size
+                valid = self._extract_valid(landmarks, EAR_IDS + SHOULDER_IDS)
+                ear = self._avg(valid, EAR_IDS)
+                shoulder = self._avg(valid, SHOULDER_IDS)
+                if ear is not None and shoulder is not None:
+                    # 归一化 -> 像素：这一步就是本类与父类的全部差别（纵横比）
+                    ear_px = (ear[0] * w, ear[1] * h)
+                    sh_px = (shoulder[0] * w, shoulder[1] * h)
+                    if _dist(ear_px, sh_px) > 1e-9:
+                        raw = self._angle_from_horizontal(sh_px, ear_px)
+                        conf = self._mean_visibility(landmarks, valid)
+                        pts = self._pts_label(valid)
+                        geom = {'head': ear_px, 'c7': sh_px}
+
+        if raw is not None:
+            self._ema = self._ema_step(raw, now)
+            self._warm_tick(now)
+
+        deg = None
+        is_valid = False
+        if raw is not None and self._warm_ready():
+            deg = self._ema
+            is_valid = True
+            self._last.update(deg=deg, conf=conf, pts=pts, geom=geom)
+
+        return {
+            'cva_proxy_deg': deg if is_valid else self._last['deg'],
+            'cva_proxy_raw_deg': raw,
+            'cva_proxy_valid': is_valid,
+            'cva_proxy_conf': conf if is_valid else self._last['conf'],
+            'cva_proxy_pts': pts if is_valid else self._last['pts'],
+            'cva_proxy_geom': geom if is_valid else self._last['geom'],
+        }
+
+    # ---------- 内部实现 ----------
+
+    def _ema_step(self, raw: float, now: float) -> float:
+        """一阶 EMA 推进一步：alpha = 1 - exp(-dt / tau)（与帧率无关）。
+
+        首帧（或 reset 后）直接取 raw 作为种子。dt 从"上一**有效**帧"算起，
+        所以丢帧期间不推进；丢失较久后 dt 变大 → alpha → 1 → 直接贴合新值，
+        不会把断开前后的两段平均在一起。
+        """
+        if self._ema is None or self._last_ts is None:
+            value = raw
+        else:
+            dt = max(0.0, now - self._last_ts)
+            alpha = 1.0 - math.exp(-dt / self.smooth_tau_sec)
+            value = self._ema + alpha * (raw - self._ema)
+        self._last_ts = now
+        return value
+
+    def _warm_tick(self, now: float) -> None:
+        """预热窗口计数（只统计有效帧）。"""
+        if self._warm_n == 0:
+            self._warm_start = now
+        self._warm_n += 1
+
+    def _warm_ready(self) -> bool:
+        """预热是否结束：帧数够 + 时间跨度够（与父类 _win_ready 同语义）。"""
+        if self._warm_n < self.min_frames or self._warm_start is None \
+                or self._last_ts is None:
+            return False
+        return self._last_ts - self._warm_start >= self.min_window_seconds
+
+    @staticmethod
+    def _mean_visibility(landmarks: list, valid: Dict[int, Point]) -> Optional[float]:
+        """本帧参与计算的点（已过门控）的平均置信度 0~1（供显示/审计）。"""
+        vals = [landmarks[pid][3] for pid in valid if pid < len(landmarks)]
+        if not vals:
+            return None
+        return sum(vals) / len(vals)
+
+    @staticmethod
+    def _pts_label(valid: Dict[int, Point]) -> str:
+        """本帧用了哪些点，如 "ear_mid+sh_mid" / "earL+sh_mid"（与录制 CSV 的
+        head_ref / c7_ref 命名一致，方便离线核对）。"""
+        if 3 in valid and 4 in valid:
+            head = "ear_mid"
+        else:
+            head = "earL" if 3 in valid else "earR"
+        if 5 in valid and 6 in valid:
+            c7 = "sh_mid"
+        else:
+            c7 = "shL" if 5 in valid else "shR"
+        return f"{head}+{c7}"
+
+
+# ---------------------------------------------------------------------------
+# EarShoulderProxyFeatures：正面机位的 Ear–Shoulder displacement proxy
+# （2026-09-23 新增，纯 stdlib；**实验特征，尚未接入任何 decision**）
+# ---------------------------------------------------------------------------
+
+class EarShoulderProxyFeatures(ErgonomicRiskFeatures):
+    """Ear–Shoulder displacement proxy：耳-肩水平位移 ÷ 肩宽（**实验特征**）。
+
+    === 是什么 / 不是什么（重要）===
+    这是**图像平面里的相对水平位移的代理指标（proxy）**：
+        * 它量的是 2D 图像平面上"耳中点相对肩中点在水平方向偏了多少"，
+          用肩宽归一化掉远近/体型；
+        * 它**不是**真实的 3D 前伸距离 —— 单目图像里头的水平位移既可能来自
+          头前伸，也可能来自整个人的体重塌陷、椅子/取景变化、身体旋转；
+        * 所以只能叫 **Ear–Shoulder displacement proxy**，**不能**叫 Forward
+          Head Distance（FHD）、**不能**声称是 3D forward displacement、
+          **不能**叫 clinical FHD（与 CvaProxyFeatures 的命名纪律同源）。
+    引入原因：正面机位下"耳-肩连线 vs 水平线"的**角度**会被 ~280px 的耳-肩
+    竖直间距压掉（实测 Δx 19/29/53px 经 atan 只剩 3.9°/6.5°/13.9°，Normal 与
+    Slight 只差 2.7° ≈ 噪声），而 **Δx/肩宽** 在正面实测单调且分得开
+    （Normal/Slight/Obvious ≈ 0.041/0.061/0.109，2026-09-23 单人多机位一次观测）。
+    **方向与 cva_proxy_deg 相反**：本指标**越大越前伸**（cva_proxy_deg 越小越前伸）。
+
+    === 数学定义（单帧，像素空间）===
+        参与点先过置信度门控 visibility >= visibility_min（默认 0.3）；
+        双肩**都**可见才算（分母要两肩），耳至少可见一只：
+            耳中点   = 可见耳点(3/4)的中点（单耳时就是那只）
+            肩中点   = 双肩点(5/6)的中点（**C7 近似**，与 CvaProxyFeatures 同）
+            肩宽     = |肩点5 − 肩点6| 的**欧氏像素距离**
+            ear_shoulder_proxy = |耳中点x − 肩中点x| ÷ 肩宽     （无单位，>= 0）
+
+    === 为什么在像素空间算 ===
+    分子分母同为长度，大多数情况下比值与坐标空间无关，但归一化坐标下
+    `tan θ` 类量会带上纵横比：肩宽用欧氏距离时，肩线一有倾斜，归一化空间里
+    的 Δy 会被 H 缩放得与 Δx 不同步，比值就不再干净。固定在**像素空间**算
+    （与 CvaProxyFeatures 同一理由），换分辨率不影响、换纵横比仍建议重标。
+
+    === 视角退化（肩宽塌陷）===
+    侧身时肩宽被投影压扁（正对归一化肩宽 ~0.56、侧身 0.01~0.21，见 CLAUDE.md），
+    分母变小会把比值放大成无意义的大数 → 归一化肩宽 < min_shoulder_width_norm
+    （默认 MIN_SHOULDER_WIDTH_NORM=0.25）的帧判**视角退化**：
+    `ear_shoulder_proxy_valid=False`，不进 EMA、不计预热、不进统计；但
+    raw 值与肩宽仍照常返回（CSV 里看得到），便于审计退化帧。
+
+    === 时间平滑：一阶 EMA（与 CvaProxyFeatures 同一套）===
+        alpha = 1 - exp(-dt / smooth_tau_sec)，与帧率无关；只在"有效帧"
+        （非退化、能算出 raw）上推进；raw 同时保留在 ear_shoulder_proxy_raw，
+        两个值都进 CSV —— 离线分析时**先看 raw 的组内离散度**，别让平滑冒充
+        可重复性（做测量验证时平滑值只作参考）。
+        预热：凑够 min_frames 帧且跨度 >= min_window_seconds 前不出平滑值
+        （valid=False），raw 从第一帧就有。
+
+    === 降级（关键点缺失 / 低置信 / 取不到 image_size）===
+    本帧不算 → raw=None、valid=False；平滑值与 conf/pts/geom 都维持上一有效值
+    （从未有效则 None），不报错、不出 0。
+    `ear_shoulder_proxy_parts`（肩宽/中点 x/四个单点置信度）是**本帧**的原始量
+    —— 即使本帧退化/降级也照常返回，这样 CSV 里能看出"为什么这帧不算数"。
+
+    === 与 decision 的关系（本轮边界，别越界）===
+    本类**只算不判**，当前**没有任何 decision 消费它**：正面机位的实验阈值
+    还只是单人多机位的一次观测（in-sample），不足以进生产判据。实验分级在
+    独立脚本 test_front_ear_shoulder_proxy.py 里做（阈值也放在那里，标明
+    experimental）。45° 机位继续用 CvaProxyFeatures + FhpDecision，两者互不影响。
+
+    继承 ErgonomicRiskFeatures 与 CvaProxyFeatures 同理：只为复用取点原语
+    （_extract_valid / _avg），语义上不是父类的特例 —— 父类的 CVA/FSA 语义
+    与本类无关（本类不读、不写它们的字段）。
+
+    接口约定（保持稳定，别改签名）：
+        EarShoulderProxyFeatures(window_seconds=3.0, min_frames=5,
+                                 min_window_seconds=1.0, visibility_min=0.3,
+                                 smooth_tau_sec=1.0,
+                                 min_shoulder_width_norm=0.25)
+        update(pose_result, timestamp=None) -> dict
+            {'ear_shoulder_proxy':        float | None  EMA 平滑值（越大越前伸）
+             'ear_shoulder_proxy_raw':    float | None  本帧原始值（未平滑）
+             'ear_shoulder_proxy_valid':  bool          本帧能否用于统计/判据
+             'ear_shoulder_proxy_conf':   float | None  参与点平均置信度 0~1
+             'ear_shoulder_proxy_pts':    str | None    如 "ear_mid+sh_mid"
+             'ear_shoulder_proxy_geom':   dict | None   {'ear_mid','sh_mid',
+                                                        'sh_width_px'}（像素）
+             'ear_shoulder_proxy_parts':  dict          本帧原始量（CSV 列）：
+                                        'shoulder_width','shoulder_width_norm',
+                                        'ear_mid_x','shoulder_mid_x',
+                                        'left_ear_confidence','right_ear_confidence',
+                                        'left_shoulder_confidence',
+                                        'right_shoulder_confidence'
+                                        （取不到的量 = None，不填 0）
+             'ear_shoulder_proxy_degenerate': bool      本帧是否视角退化（肩宽塌陷）}
+        reset()
+    """
+
+    def __init__(self,
+                 window_seconds: float = 3.0,
+                 min_frames: int = 5,
+                 min_window_seconds: float = 1.0,
+                 visibility_min: float = 0.3,
+                 smooth_tau_sec: float = 1.0,
+                 min_shoulder_width_norm: float = MIN_SHOULDER_WIDTH_NORM) -> None:
+        """
+        参数:
+            window_seconds / min_frames / min_window_seconds: 只用于"预热"语义
+                （凑够帧数 + 时间跨度前不出平滑值），与其它特征同约定。
+            visibility_min: 某关键点的 visibility 低于此值视为无效点（置信度过滤）。
+            smooth_tau_sec: EMA 时间常数（秒），默认 1.0（与 CvaProxyFeatures 同）。
+            min_shoulder_width_norm: 归一化肩宽下限，低于它判视角退化（见类 docstring）。
+        """
+        super().__init__(window_seconds=window_seconds, min_frames=min_frames,
+                         min_window_seconds=min_window_seconds,
+                         visibility_min=visibility_min)
+        if smooth_tau_sec <= 0:
+            raise ValueError("smooth_tau_sec 必须 > 0")
+        if min_shoulder_width_norm <= 0:
+            raise ValueError("min_shoulder_width_norm 必须 > 0")
+        self.smooth_tau_sec = smooth_tau_sec
+        self.min_shoulder_width_norm = min_shoulder_width_norm
+
+        self._ema: Optional[float] = None         # 平滑值（只在有效帧上推进）
+        self._last_ts: Optional[float] = None     # 上一有效帧时间戳（EMA 的 dt 基准）
+        self._warm_start: Optional[float] = None  # 预热窗口起点
+        self._warm_n = 0                          # 预热窗口内的有效帧数
+        self._last = {                            # 上一有效读数（降级时维持）
+            'deg': None, 'conf': None, 'pts': None, 'geom': None,
+        }
+
+    def reset(self) -> None:
+        """清空平滑状态与上一有效值，重新开始。"""
+        super().reset()
+        self._ema = None
+        self._last_ts = None
+        self._warm_start = None
+        self._warm_n = 0
+        self._last = {'deg': None, 'conf': None, 'pts': None, 'geom': None}
+
+    def update(self,
+               pose_result: Optional[dict],
+               timestamp: Optional[float] = None) -> dict:
+        """喂入一帧 pose 结果，返回 Ear–Shoulder displacement proxy（见类 docstring）。"""
+        now = timestamp if timestamp is not None else time.monotonic()
+
+        raw = conf = pts = geom = None
+        degenerate = False
+        parts = self._empty_parts()
+        if pose_result is not None:
+            landmarks = pose_result.get('landmarks')
+            size = pose_result.get('image_size')
+            if landmarks and size and size[0] > 0 and size[1] > 0:
+                w, h = size
+                valid = self._extract_valid(landmarks, EAR_IDS + SHOULDER_IDS)
+                parts = self._parts(landmarks, valid, w, h)
+                ear = self._avg(valid, EAR_IDS)
+                if ear is not None and 5 in valid and 6 in valid:
+                    sh_l, sh_r = valid[5], valid[6]
+                    sw_norm = _dist(sh_l, sh_r)
+                    degenerate = sw_norm < self.min_shoulder_width_norm
+                    ear_px = (ear[0] * w, ear[1] * h)
+                    sh_px = (((sh_l[0] + sh_r[0]) / 2.0) * w,
+                             ((sh_l[1] + sh_r[1]) / 2.0) * h)
+                    sw_px = _dist((sh_l[0] * w, sh_l[1] * h),
+                                  (sh_r[0] * w, sh_r[1] * h))
+                    if sw_px > 1e-9:
+                        # 全部在像素空间（见类 docstring）：水平位移 ÷ 肩宽
+                        raw = abs(ear_px[0] - sh_px[0]) / sw_px
+                        conf = self._mean_visibility(landmarks, valid)
+                        pts = self._pts_label(valid)
+                        geom = {'ear_mid': ear_px, 'sh_mid': sh_px,
+                                'sh_width_px': sw_px}
+
+        # 退化帧（肩宽塌陷）比值无意义：raw 照常返回供审计，但不推进 EMA、
+        # 不计预热、不算有效读数（raw 在 CSV 里看得到，valid/degenerate 标出来）。
+        if raw is not None and not degenerate:
+            self._ema = self._ema_step(raw, now)
+            self._warm_tick(now)
+
+        deg = None
+        is_valid = False
+        if raw is not None and not degenerate and self._warm_ready():
+            deg = self._ema
+            is_valid = True
+            self._last.update(deg=deg, conf=conf, pts=pts, geom=geom)
+
+        return {
+            'ear_shoulder_proxy': deg if is_valid else self._last['deg'],
+            'ear_shoulder_proxy_raw': raw,
+            'ear_shoulder_proxy_valid': is_valid,
+            'ear_shoulder_proxy_conf': conf if is_valid else self._last['conf'],
+            'ear_shoulder_proxy_pts': pts if is_valid else self._last['pts'],
+            'ear_shoulder_proxy_geom': geom if is_valid else self._last['geom'],
+            'ear_shoulder_proxy_parts': parts,
+            'ear_shoulder_proxy_degenerate': degenerate,
+        }
+
+    # ---------- 内部实现 ----------
+
+    def _ema_step(self, raw: float, now: float) -> float:
+        """一阶 EMA 推进一步（与 CvaProxyFeatures 同一套：alpha = 1 - exp(-dt/tau)）。"""
+        if self._ema is None or self._last_ts is None:
+            value = raw
+        else:
+            dt = max(0.0, now - self._last_ts)
+            alpha = 1.0 - math.exp(-dt / self.smooth_tau_sec)
+            value = self._ema + alpha * (raw - self._ema)
+        self._last_ts = now
+        return value
+
+    def _warm_tick(self, now: float) -> None:
+        """预热窗口计数（只统计能算出 raw 的非退化帧）。"""
+        if self._warm_n == 0:
+            self._warm_start = now
+        self._warm_n += 1
+
+    def _warm_ready(self) -> bool:
+        """预热是否结束：帧数够 + 时间跨度够。"""
+        if self._warm_n < self.min_frames or self._warm_start is None \
+                or self._last_ts is None:
+            return False
+        return self._last_ts - self._warm_start >= self.min_window_seconds
+
+    @staticmethod
+    def _empty_parts() -> dict:
+        """本帧原始量的空壳（取不到的量为 None，不填 0）。"""
+        return {
+            'shoulder_width': None, 'shoulder_width_norm': None,
+            'ear_mid_x': None, 'shoulder_mid_x': None,
+            'left_ear_confidence': None, 'right_ear_confidence': None,
+            'left_shoulder_confidence': None, 'right_shoulder_confidence': None,
+        }
+
+    def _parts(self, landmarks: list, valid: Dict[int, Point],
+               w: float, h: float) -> dict:
+        """本帧的原始量（全部像素 / 原始置信度），供逐帧 CSV 审计。
+
+        中点/肩宽用**过了置信度门控**的点（与指标同一个口径，改口径时两处一起改）；
+        四个单点置信度取**原始值**（含被门控掉的）—— 这样退化帧能看出是被哪只
+        耳/哪侧肩拖下来的。
+        """
+        out = self._empty_parts()
+        for pid, name in ((3, 'left_ear_confidence'), (4, 'right_ear_confidence'),
+                          (5, 'left_shoulder_confidence'),
+                          (6, 'right_shoulder_confidence')):
+            if pid < len(landmarks):
+                out[name] = float(landmarks[pid][3])
+        ear = self._avg(valid, EAR_IDS)
+        if ear is not None:
+            out['ear_mid_x'] = ear[0] * w
+        if 5 in valid and 6 in valid:
+            sh_l, sh_r = valid[5], valid[6]
+            out['shoulder_mid_x'] = (sh_l[0] + sh_r[0]) / 2.0 * w
+            out['shoulder_width_norm'] = _dist(sh_l, sh_r)
+            out['shoulder_width'] = _dist((sh_l[0] * w, sh_l[1] * h),
+                                          (sh_r[0] * w, sh_r[1] * h))
+        return out
+
+    @staticmethod
+    def _mean_visibility(landmarks: list, valid: Dict[int, Point]) -> Optional[float]:
+        """本帧参与计算的点（已过门控）的平均置信度 0~1（供显示/审计）。"""
+        vals = [landmarks[pid][3] for pid in valid if pid < len(landmarks)]
+        if not vals:
+            return None
+        return sum(vals) / len(vals)
+
+    @staticmethod
+    def _pts_label(valid: Dict[int, Point]) -> str:
+        """本帧用了哪些点，如 "ear_mid+sh_mid" / "earL+sh_mid"（双肩是硬要求）。"""
+        if 3 in valid and 4 in valid:
+            ear = "ear_mid"
+        else:
+            ear = "earL" if 3 in valid else "earR"
+        return f"{ear}+sh_mid"
+
+
+# ---------------------------------------------------------------------------
 # 自测：纯 stdlib 合成数据，验证各特征计算逻辑（main_demo.py --selftest 汇总调用）
 # ---------------------------------------------------------------------------
 
@@ -844,6 +1365,27 @@ def _make_pose(pts: dict, vis: float = 1.0) -> dict:
 def _assert_close(actual: float, expected: float, eps: float, msg: str) -> None:
     if abs(actual - expected) > eps:
         raise AssertionError(f"{msg}: 期望 {expected:.4f}，实际 {actual:.4f}")
+
+
+def _make_pose_sized(pts: dict, size: tuple,
+                     vis: float = 1.0,
+                     vis_map: Optional[dict] = None) -> dict:
+    """同 _make_pose，但可指定画面尺寸 / 逐点置信度（CvaProxyFeatures 自测用）。
+
+    pts:     {关键点编号: (x, y)}，归一化坐标。
+    size:    (w, h) 画面尺寸（像素空间角度依赖它）。
+    vis:     未在 vis_map 里单独指定的可见点的统一置信度。
+    vis_map: {关键点编号: 该点置信度}，覆盖 vis。
+    """
+    landmarks = []
+    for pid in range(17):
+        if pid in pts:
+            x, y = pts[pid]
+            v = vis if vis_map is None else vis_map.get(pid, vis)
+            landmarks.append((x, y, 0.0, v))
+        else:
+            landmarks.append((0.0, 0.0, 0.0, 0.0))
+    return {"landmarks": landmarks, "image_size": size}
 
 
 def selftest_movement() -> None:
@@ -1081,8 +1623,231 @@ def selftest_ergonomic() -> None:
     print("  selftest_ergonomic: OK")
 
 
+def selftest_cva_proxy() -> None:
+    """合成数据自测 CvaProxyFeatures：像素空间（纵横比）角、EMA 跟踪与 raw 保留、
+    预热不出平滑值、降级维持旧值、单耳/单肩取值与 pts 标签、置信度门控、
+    image_size 缺失时降级不报错。"""
+    small = dict(min_frames=3, min_window_seconds=0.1, smooth_tau_sec=1.0)
+
+    # 1) 像素空间：W=200,H=100 上 dx_px=dy_px=20 → 45°；同一组点用归一化坐标算
+    #    会得到 63.43°（atan2(0.2, 0.1)）—— 证明坐标系不同、数值不可混用
+    pts45 = {3: (0.6, 0.3), 4: (0.6, 0.3),      # 耳中点 (120, 30) px
+             5: (0.5, 0.5), 6: (0.5, 0.5)}      # 肩中点 (100, 50) px
+    fe = CvaProxyFeatures(**small)
+    r = fe.update(_make_pose_sized(pts45, (200, 100)), timestamp=0.0)
+    assert r['cva_proxy_raw_deg'] is not None, "第一帧应有 raw 值"
+    _assert_close(r['cva_proxy_raw_deg'], 45.0, 1e-6, "像素空间角应为 45°")
+    normalized = math.degrees(math.atan2(0.2, 0.1))
+    assert abs(normalized - 63.4349) < 1e-3, normalized
+    assert abs(normalized - r['cva_proxy_raw_deg']) > 18.0, \
+        "像素角必须明显区别于归一化角（纵横比偏差），否则本类没起到作用"
+
+    # 2) 预热：min_frames=3 且跨度 >= 0.1s 之前不出平滑值，raw 照常给
+    assert r['cva_proxy_deg'] is None and not r['cva_proxy_valid'], \
+        "首帧应还没预热完（不出平滑值）"
+    fe.update(_make_pose_sized(pts45, (200, 100)), timestamp=0.05)
+    r = fe.update(_make_pose_sized(pts45, (200, 100)), timestamp=0.2)
+    assert r['cva_proxy_valid'], "攒够帧数+时间跨度后应出平滑值"
+    _assert_close(r['cva_proxy_deg'], 45.0, 1e-6, "读数恒定 → EMA 应停在 45°")
+
+    # 3) EMA：从 45° 跳到 90°（耳抬到肩正上方）→ raw 立刻是 90，平滑值只走一段
+    upright = {3: (0.5, 0.3), 4: (0.5, 0.3),    # 耳中点 (100, 30)：与肩同 x → 90°
+               5: (0.5, 0.5), 6: (0.5, 0.5)}
+    r = fe.update(_make_pose_sized(upright, (200, 100)), timestamp=0.3)
+    _assert_close(r['cva_proxy_raw_deg'], 90.0, 1e-6, "raw 应立刻到 90°")
+    assert 45.0 < r['cva_proxy_deg'] < 90.0, \
+        f"平滑值应只走一段（45<v<90），实际 {r['cva_proxy_deg']:.3f}"
+    first_step = r['cva_proxy_deg']
+    # 关键点抖动 1 帧：raw 跳一下，平滑值基本不动（这就是平滑的意义）
+    r = fe.update(_make_pose_sized(pts45, (200, 100)), timestamp=0.4)
+    assert abs(r['cva_proxy_deg'] - first_step) < 3.0, "单帧抖动不该把平滑值拉回去"
+    # 持续喂 90° → 单调逼近 90°，不过冲
+    prev = r['cva_proxy_deg']
+    for i in range(1, 60):
+        r = fe.update(_make_pose_sized(upright, (200, 100)),
+                      timestamp=0.4 + i * 0.1)
+        assert prev <= r['cva_proxy_deg'] <= 90.0, "EMA 应单调逼近且不过冲"
+        prev = r['cva_proxy_deg']
+    assert r['cva_proxy_deg'] > 89.0, f"持续 6s 后应贴近 90°，实际 {r['cva_proxy_deg']:.2f}"
+
+    # 4) 降级：只剩髋点（耳/肩都不可见）→ raw=None、valid=False、平滑值维持上一有效值
+    held = r['cva_proxy_deg']
+    r = fe.update(_make_pose_sized({11: (0.5, 0.8), 12: (0.5, 0.8)}, (200, 100)),
+                  timestamp=6.5)
+    assert r['cva_proxy_raw_deg'] is None and not r['cva_proxy_valid'], \
+        "关键点不足应降级（raw 为 None、valid=False）"
+    _assert_close(r['cva_proxy_deg'], held, 1e-9, "降级时应维持上一有效平滑值")
+
+    # 5) 无人 / image_size 缺失 → 降级不报错
+    r = fe.update(None, timestamp=6.6)
+    assert r['cva_proxy_deg'] is None or r['cva_proxy_valid'] is False
+    no_size = {'landmarks': [(0.5, 0.3, 0.0, 1.0)] * 17}   # 故意不给 image_size
+    r = fe.update(no_size, timestamp=6.7)
+    assert r['cva_proxy_raw_deg'] is None and not r['cva_proxy_valid'], \
+        "取不到 image_size 时应降级（像素空间角度算不了）"
+
+    # 6) 单耳 + 双肩：pts 标签标出用了哪只耳；conf = 参与点平均置信度
+    one_ear = {3: (0.6, 0.3), 5: (0.5, 0.5), 6: (0.5, 0.5)}
+    vis_map = {3: 0.6, 5: 0.8, 6: 0.9}
+    fe = CvaProxyFeatures(**small)
+    for i in range(4):
+        r = fe.update(_make_pose_sized(one_ear, (200, 100), vis_map=vis_map),
+                      timestamp=i * 0.1)
+    assert r['cva_proxy_pts'] == "earL+sh_mid", r['cva_proxy_pts']
+    _assert_close(r['cva_proxy_conf'], (0.6 + 0.8 + 0.9) / 3.0, 1e-9,
+                  "conf 应为参与点（耳+双肩）的平均置信度")
+    # 几何：head 是耳(120,30)、c7 是肩中点(100,50)
+    g = r['cva_proxy_geom']
+    _assert_close(g['head'][0], 120.0, 1e-6, "geom.head.x 应为耳像素 x")
+    _assert_close(g['head'][1], 30.0, 1e-6, "geom.head.y 应为耳像素 y")
+    _assert_close(g['c7'][1], 50.0, 1e-6, "geom.c7.y 应为肩中点像素 y")
+
+    # 7) 置信度门控：耳低于 visibility_min（0.3）→ 耳被丢，只剩肩 → 本帧降级
+    fe = CvaProxyFeatures(**small)
+    r = fe.update(_make_pose_sized({3: (0.6, 0.3), 4: (0.6, 0.3),
+                                    5: (0.5, 0.5), 6: (0.5, 0.5)}, (200, 100),
+                                   vis_map={3: 0.2, 4: 0.2, 5: 0.9, 6: 0.9}),
+                  timestamp=0.0)
+    assert r['cva_proxy_raw_deg'] is None, "低置信度的耳应被门控掉 → 算不出读数"
+
+    print("  selftest_cva_proxy: OK")
+
+
+def selftest_ear_shoulder_proxy() -> None:
+    """合成数据自测 EarShoulderProxyFeatures：像素空间定义（水平位移 ÷ 肩宽）、
+    尺度不变性、方向（越大越前伸）、EMA 跟踪与 raw 保留、预热不出平滑值、
+    肩宽塌陷（侧身）判退化、单肩缺失降级、parts 的逐帧原始量与 pts 标签、
+    参数校验。"""
+    small = dict(min_frames=3, min_window_seconds=0.1, smooth_tau_sec=1.0)
+
+    # 合成几何：肩 (0.35,0.5)/(0.65,0.5) → 归一化肩宽 0.30（>0.25，不算退化）、
+    # 200x100 画面上肩宽 60px、肩中点 x=100px；耳中点 x = (0.5 + dx)*200
+    base = {5: (0.35, 0.5), 6: (0.65, 0.5)}
+
+    def _esp(dx_norm, size=(200, 100), vis=1.0, vis_map=None, override=None):
+        pts = dict(base)
+        pts[3] = (0.5 + dx_norm, 0.3)
+        pts[4] = (0.5 + dx_norm, 0.3)
+        if override:
+            pts.update(override)
+        return _make_pose_sized(pts, size, vis=vis, vis_map=vis_map)
+
+    # 1) 定义：raw = |耳中点x − 肩中点x| / 肩宽（全像素空间）
+    fe = EarShoulderProxyFeatures(**small)
+    r = fe.update(_esp(0.0), timestamp=0.0)
+    _assert_close(r['ear_shoulder_proxy_raw'], 0.0, 1e-9,
+                  "耳在肩中点正上方 → 水平位移 0 → proxy 0")
+
+    fe = EarShoulderProxyFeatures(**small)
+    r = fe.update(_esp(0.1), timestamp=0.0)          # Δx = 20px / 60px 肩宽
+    _assert_close(r['ear_shoulder_proxy_raw'], 20.0 / 60.0, 1e-9,
+                  "Δx=20px、肩宽 60px → proxy = 1/3")
+
+    # 2) 尺度不变：同一归一化几何换分辨率 → 比值不变（分子分母同为水平长度）
+    r_big = EarShoulderProxyFeatures(**small).update(_esp(0.1, size=(400, 200)),
+                                                     timestamp=0.0)
+    _assert_close(r_big['ear_shoulder_proxy_raw'], 20.0 / 60.0, 1e-9,
+                  "换分辨率不应改变 proxy（比值与画面尺寸无关）")
+
+    # 3) 方向：位移越大 proxy 越大（**越大越前伸**，与 cva_proxy_deg 相反）
+    vals = []
+    for dx in (0.0, 0.05, 0.1, 0.2):
+        vals.append(EarShoulderProxyFeatures(**small)
+                    .update(_esp(dx), timestamp=0.0)['ear_shoulder_proxy_raw'])
+    assert vals == sorted(vals) and vals[0] == 0.0, f"应单调递增：{vals}"
+    _assert_close(vals[-1], 40.0 / 60.0, 1e-9, "Δx=40px → proxy = 2/3")
+
+    # 4) 预热：raw 从第一帧就有，平滑值要凑够帧数 + 时间跨度才出
+    fe = EarShoulderProxyFeatures(**small)
+    r = fe.update(_esp(0.1), timestamp=0.0)
+    assert r['ear_shoulder_proxy_raw'] is not None, "raw 第一帧就应有值"
+    assert r['ear_shoulder_proxy'] is None and not r['ear_shoulder_proxy_valid'], \
+        "预热未满不该出平滑值"
+    for i in (1, 2):
+        r = fe.update(_esp(0.1), timestamp=i * 0.05)
+    assert r['ear_shoulder_proxy_valid'], "3 帧 / 0.1s 后应出平滑值"
+    _assert_close(r['ear_shoulder_proxy'], 1.0 / 3.0, 1e-9,
+                  "读数恒定时平滑值应收敛到该读数")
+
+    # 5) EMA 跟踪：阶跃变化后平滑值落在新旧之间（滞后但不跳变）
+    r = fe.update(_esp(0.3), timestamp=0.25)         # 阶跃到 1.0
+    _assert_close(r['ear_shoulder_proxy_raw'], 1.0, 1e-9, "本帧 raw 应为阶跃后的值")
+    assert 1.0 / 3.0 < r['ear_shoulder_proxy'] < 1.0, \
+        f"平滑值应滞后于阶跃：{r['ear_shoulder_proxy']}"
+
+    # 6) 视角退化（侧身肩宽塌缩）：肩宽 0.02 归一化 < 0.25 → 不算有效读数，
+    #    但 raw 与肩宽照常返回（CSV 里看得见这个被放大的数）
+    fe = EarShoulderProxyFeatures(**small)
+    for i in range(4):
+        fe.update(_esp(0.1), timestamp=i * 0.05)
+    ok = fe.update(_esp(0.1), timestamp=0.2)
+    held = fe.update(_esp(0.1, override={5: (0.49, 0.5), 6: (0.51, 0.5)}),
+                     timestamp=0.25)
+    assert held['ear_shoulder_proxy_degenerate'], "肩宽塌陷应判视角退化"
+    assert not held['ear_shoulder_proxy_valid'], "退化帧不算有效读数"
+    assert held['ear_shoulder_proxy'] == ok['ear_shoulder_proxy'], \
+        "退化帧应维持上一有效平滑值"
+    assert held['ear_shoulder_proxy_raw'] > 1.0, \
+        f"退化帧 raw 仍记录（且被放大）：{held['ear_shoulder_proxy_raw']}"
+    assert held['ear_shoulder_proxy_parts']['shoulder_width'] < 10.0
+
+    # 7) 单肩不可见（置信度门控）→ 分母不齐 → 本帧降级；parts 仍给出原始置信度
+    fe = EarShoulderProxyFeatures(**small)
+    r = fe.update(_esp(0.1, vis_map={6: 0.2}), timestamp=0.0)
+    assert r['ear_shoulder_proxy_raw'] is None, "只有单肩时算不出肩宽，应降级"
+    assert not r['ear_shoulder_proxy_valid']
+    _assert_close(r['ear_shoulder_proxy_parts']['right_shoulder_confidence'], 0.2,
+                  1e-9, "parts 应给出被门控掉的点的原始置信度")
+    assert r['ear_shoulder_proxy_parts']['shoulder_width'] is None, \
+        "分母不齐时肩宽应为 None（不填 0）"
+
+    # 8) 单耳可见：pts 标签标出用了哪只耳；conf = 参与点（耳+双肩）平均
+    vis_map = {3: 0.6, 4: 0.2, 5: 0.8, 6: 0.9}
+    fe = EarShoulderProxyFeatures(**small)
+    for i in range(3):
+        r = fe.update(_esp(0.1, vis_map=vis_map), timestamp=i * 0.05)
+    assert r['ear_shoulder_proxy_pts'] == "earL+sh_mid", r['ear_shoulder_proxy_pts']
+    _assert_close(r['ear_shoulder_proxy_conf'], (0.6 + 0.8 + 0.9) / 3.0, 1e-9,
+                  "conf 应为参与点（耳+双肩）的平均置信度")
+    _assert_close(r['ear_shoulder_proxy_geom']['ear_mid'][0], 120.0, 1e-6,
+                  "geom.ear_mid.x 应为耳中点像素 x")
+    _assert_close(r['ear_shoulder_proxy_geom']['sh_width_px'], 60.0, 1e-6,
+                  "geom.sh_width_px 应为两肩像素距离")
+    _assert_close(r['ear_shoulder_proxy_parts']['ear_mid_x'], 120.0, 1e-6,
+                  "parts.ear_mid_x 应为耳中点像素 x")
+    _assert_close(r['ear_shoulder_proxy_parts']['shoulder_mid_x'], 100.0, 1e-6,
+                  "parts.shoulder_mid_x 应为肩中点像素 x")
+    _assert_close(r['ear_shoulder_proxy_parts']['shoulder_width_norm'], 0.30, 1e-9,
+                  "parts.shoulder_width_norm 应为归一化肩宽")
+
+    # 9) 无人 / image_size 缺失 → 降级不报错，parts 全 None（不填 0）
+    fe = EarShoulderProxyFeatures(**small)
+    r = fe.update(None, timestamp=0.0)
+    assert r['ear_shoulder_proxy_raw'] is None and not r['ear_shoulder_proxy_valid']
+    assert set(r['ear_shoulder_proxy_parts'].values()) == {None}
+    no_size = {'landmarks': [(0.5, 0.3, 0.0, 1.0)] * 17}   # 故意不给 image_size
+    r = fe.update(no_size, timestamp=0.1)
+    assert r['ear_shoulder_proxy_raw'] is None, "无 image_size 时应降级（像素空间）"
+
+    # 10) reset() 清空平滑状态；非法参数抛 ValueError
+    fe.reset()
+    assert fe.update(_esp(0.1), timestamp=9.0)['ear_shoulder_proxy'] is None, \
+        "reset 后应回到预热状态"
+    for kw in (dict(smooth_tau_sec=0.0), dict(min_shoulder_width_norm=0.0)):
+        try:
+            EarShoulderProxyFeatures(**kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{kw} 应抛 ValueError")
+
+    print("  selftest_ear_shoulder_proxy: OK")
+
+
 if __name__ == "__main__":
     selftest_movement()
     selftest_posture()
     selftest_ergonomic()
+    selftest_cva_proxy()
+    selftest_ear_shoulder_proxy()
     print("features selftest: ALL PASSED")
