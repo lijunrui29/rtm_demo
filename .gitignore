@@ -13,3 +13,15 @@ __pycache__/
 *.log
 # --perf-log 的输出（单次测量快照，不提交）
 performance_log.csv
+
+# 实拍读数 CSV 与报告（逐帧角度 = 个人身体数据，不提交；只在本地留档）
+# 真机实采按 front_p1_live1.csv 这种命名，用通配盖住换人/换次的新名字
+f45.csv
+front.csv
+front_p*.csv
+*_report.txt
+# 各入口/脚本的默认输出（内容同样是实拍读数）
+fhp_frames.csv
+fhp_cva_proxy.csv
+front_ear_shoulder_proxy.csv
+pose_schema_dump.json
